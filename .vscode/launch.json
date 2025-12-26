@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+   
+    {
+      "name": "yaml2opnsense: Debug run.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "nammane.arpa.yaml"
+      ],
+    },
+    {
+      "name": "yaml2opnsense: Run with tests (sudo)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "console": "integratedTerminal",
+      "sudo": true,
+      "args": [
+        "nammane.arpa.yaml",
+        "--test",
+        "eth0"
+      ],
+    }
+  ]
+}
