@@ -71,3 +71,4 @@ Thumbs.db
 # Project specific
 *.yaml.bak
 *.bak
+.vscode/launch.json
