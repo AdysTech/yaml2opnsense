@@ -11,6 +11,7 @@ your.domain.name:
   # --- Custom DNS Forwarding ---
   # Defines DNS queries to be forwarded to specific servers.
   # Useful for routing internal domains or using services like AdGuard.
+  # NOTE: VLAN-based DNS forwarding (to dnsmasq) is automatically generated.
   dns_forwards:
     - domain: ""              # A blank domain acts as a catch-all forwarder
       server: "192.168.1.10"  # IP of the DNS server to forward to
@@ -20,6 +21,23 @@ your.domain.name:
       server: "192.168.1.1"
       port: 53
       description: "Internal DNS"
+
+  # --- Connectivity Tests ---
+  # Defines DNS and connectivity validation tests used by the validator.
+  # These tests are applied to all VLANs during validation.
+  connectivity_tests:
+    reverse_lookup:
+      ip: 192.168.21.10         # IP to perform reverse DNS lookup (PTR query)
+      fqdn: "host.domain.com"   # Expected FQDN from PTR record
+    internal_lookup:
+      host: "hostname"          # Internal hostname (will append domain if no dots)
+      ip: 192.168.21.10         # Expected resolved IP address
+    external_lookup:
+      host: "one.one.one.one"   # External hostname to resolve
+      ip: 1.1.1.1               # Expected resolved IP (checks if in A records)
+    overridden_lookup:
+      host: "external.com"      # Hostname with DNS override configured
+      ip: 192.168.23.1          # Expected internal IP (from DNS override)
 
   # --- VLAN Definitions ---
   # Each key under 'vlans' is a new VLAN.

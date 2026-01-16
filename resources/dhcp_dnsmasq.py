@@ -38,10 +38,10 @@ def build_static_hosts(cfg):
         for _, entry in leases.items():
             hosts.append({
                 "host": entry["hostname"],
-                "domain": domain,
-                "ip": entry["ip"],
+                "domain":entry.get("domain", domain),
+                "ip": v.get("gateway") if entry.get("ip") == "gateway" else entry.get("ip"),
                 "hwaddr": entry.get("mac",""),
-                "descr": ""
+                "descr": entry.get("description",""),
             })
 
     return hosts

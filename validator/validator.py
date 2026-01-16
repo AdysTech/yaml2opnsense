@@ -163,9 +163,94 @@ class VLANValidator:
 
             # DNS test
             if dhcp.get("name_server"):
-                dns_result = self.dns.test(dhcp["name_server"], vlan_context, rx_sniffer=rx_sniffer)
-                print(f"DNS: {dns_result}")
-                result.dns = "OK" if dns_result else "FAIL"
+                dns_server = dhcp["name_server"]
+                print(f"\n--- DNS Tests ---")
+                
+                # Run connectivity_tests DNS lookups
+                connectivity_tests = vlan.get("connectivity_tests", {})
+                dns_tests_passed = 0
+                dns_tests_total = 0
+                
+                if connectivity_tests:
+                    # Test reverse lookup (PTR)
+                    if "reverse_lookup" in connectivity_tests:
+                        test = connectivity_tests["reverse_lookup"]
+                        dns_tests_total += 1
+                        print(f"Testing reverse lookup: {test['ip']} -> {test['fqdn']}")
+                        reply = self.dns.test_ptr(dns_server, vlan_context, target_ip=test["ip"], rx_sniffer=rx_sniffer)
+                        if reply:
+                            resolved_fqdns = self.dns.get_resolved_fqdns(reply)
+                            expected_fqdn = test.get("fqdn")
+                            if expected_fqdn in resolved_fqdns:
+                                print(f"  Reverse lookup ({test['ip']}): OK - {resolved_fqdns}")
+                                dns_tests_passed += 1
+                            else:
+                                print(f"  Reverse lookup ({test['ip']}): FAIL - got {resolved_fqdns}, expected {expected_fqdn}")
+                        else:
+                            print(f"  Reverse lookup ({test['ip']}): FAIL - no response")
+                    
+                    # Test internal lookup (A record for internal host)
+                    if "internal_lookup" in connectivity_tests:
+                        test = connectivity_tests["internal_lookup"]
+                        dns_tests_total += 1
+                        
+                        # Append search domain if hostname doesn't contain a dot
+                        query_domain = test["host"]
+                        if "." not in query_domain and dhcp.get("domain"):
+                            domain = dhcp["domain"]
+                            if isinstance(domain, bytes):
+                                domain = domain.decode('utf-8')
+                            query_domain = f"{query_domain}.{domain}"
+                        
+                        reply = self.dns.test(dns_server, vlan_context, domain=query_domain, rx_sniffer=rx_sniffer)
+                        if reply:
+                            resolved_ips = self.dns.get_resolved_ips(reply)
+                            expected_ip = test.get("ip")
+                            if expected_ip in resolved_ips:
+                                print(f"  Internal lookup ({test['host']}): OK - {resolved_ips}")
+                                dns_tests_passed += 1
+                            else:
+                                print(f"  Internal lookup ({test['host']}): FAIL - got {resolved_ips}, expected {expected_ip}")
+                        else:
+                            print(f"  Internal lookup ({test['host']}): FAIL - no response")
+                    
+                    # Test external lookup (A record for external host)
+                    if "external_lookup" in connectivity_tests:
+                        test = connectivity_tests["external_lookup"]
+                        dns_tests_total += 1
+                        reply = self.dns.test(dns_server, vlan_context, domain=test["host"], rx_sniffer=rx_sniffer)
+                        if reply:
+                            resolved_ips = self.dns.get_resolved_ips(reply)
+                            expected_ip = test.get("ip")
+                            if expected_ip in resolved_ips:
+                                print(f"  External lookup ({test['host']}): OK - {resolved_ips}")
+                                dns_tests_passed += 1
+                            else:
+                                print(f"  External lookup ({test['host']}): FAIL - got {resolved_ips}, expected {expected_ip}")
+                        else:
+                            print(f"  External lookup ({test['host']}): FAIL - no response")
+                    
+                    # Test overridden lookup (should resolve to internal IP via DNS override)
+                    if "overridden_lookup" in connectivity_tests:
+                        test = connectivity_tests["overridden_lookup"]
+                        dns_tests_total += 1
+                        reply = self.dns.test(dns_server, vlan_context, domain=test["host"], rx_sniffer=rx_sniffer)
+                        if reply:
+                            resolved_ips = self.dns.get_resolved_ips(reply)
+                            expected_ip = test.get("ip")
+                            if expected_ip in resolved_ips:
+                                print(f"  Overridden lookup ({test['host']}): OK - {resolved_ips}")
+                                dns_tests_passed += 1
+                            else:
+                                print(f"  Overridden lookup ({test['host']}): FAIL - got {resolved_ips}, expected {expected_ip}")
+                        else:
+                            print(f"  Overridden lookup ({test['host']}): FAIL - no response")
+                
+                # Set overall DNS result
+                if dns_tests_total > 0:
+                    result.dns = "OK" if dns_tests_passed == dns_tests_total else "FAIL"
+                else:
+                    result.dns = "N/A"
 
             # NTP test
             if dhcp.get("NTP_server"):

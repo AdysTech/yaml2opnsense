@@ -47,6 +47,9 @@ def apply(path, test_interface=None):
         print("Running VLAN validation tests")        
         print("=" * 60)
 
+        # Get connectivity tests config
+        connectivity_tests = cfg.get("connectivity_tests", {})
+
         for vlan_name, vlan_cfg in cfg["vlans"].items():
             vlan_test_cfg = {
                 "id": vlan_cfg["id"],
@@ -57,6 +60,7 @@ def apply(path, test_interface=None):
                 "dhcp_options": vlan_cfg.get("dhcp_options"),
                 "private_network": vlan_cfg.get("private_network"),
                 "public_network": vlan_cfg.get("public_network"),
+                "connectivity_tests": connectivity_tests,
             }
             try:
                 validator.validate_vlan(vlan_test_cfg)

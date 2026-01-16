@@ -99,7 +99,7 @@ def _validate_vlans(cfg: dict) -> None:
                     errors.append(f"vlan '{name}': static_leases entry '{key}' must be a mapping")
                     continue
                 host = entry.get("hostname")
-                ip = entry.get("ip")
+                ip =gw if entry.get("ip")== "gateway" else  entry.get("ip")
                 mac = entry.get("mac")
                 if not host or not isinstance(host, str):
                     errors.append(f"vlan '{name}': static lease '{key}' missing valid 'hostname'")
