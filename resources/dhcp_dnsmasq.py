@@ -42,6 +42,7 @@ def build_static_hosts(cfg):
                 "ip": v.get("gateway") if entry.get("ip") == "gateway" else entry.get("ip"),
                 "hwaddr": entry.get("mac",""),
                 "descr": entry.get("description",""),
+                "tags": entry.get("tags", []),
             })
 
     return hosts
@@ -171,7 +172,49 @@ def _set_option(client: OpnClient, uuid: str, payload: dict):
 def _add_option(client: OpnClient, payload: dict):
     return client.post("/api/dnsmasq/settings/add_option", {"option": payload})
 
-def apply_dnsmasq_hosts(cfg, client: OpnClient) -> bool:
+def _get_tag_list(client: OpnClient):
+    try:
+        data = client.get("/api/dnsmasq/settings/get_tag_list")
+        tags = data.get("tags", {}).get("items", [])
+        return {item["label"]: item["value"] for item in tags}
+    except Exception:
+        return {}
+
+def _add_tag(client: OpnClient, tag_name: str):
+    payload = {"tag": {"name": tag_name}}
+    return client.post("/api/dnsmasq/settings/add_tag", payload)
+
+def ensure_tags_exist(cfg, client: OpnClient) -> dict:
+    """
+    Ensure all tags referenced in the config exist in OPNsense.
+    Returns a map of tag_label -> tag_uuid.
+    """
+    existing_tags = _get_tag_list(client)
+    tag_map = existing_tags.copy()
+    
+    # Collect all unique tags from static_leases
+    required_tags = set()
+    for vlan in cfg["vlans"].values():
+        for lease in vlan.get("static_leases", {}).values():
+            tags = lease.get("tags", [])
+            required_tags.update(tags)
+        
+        # Also collect tags from dhcp_tagged_options
+        for tagged_opt in vlan.get("dhcp_tagged_options", []):
+            tag = tagged_opt.get("tag")
+            if tag:
+                required_tags.add(tag)
+    
+    # Create missing tags
+    for tag in required_tags:
+        if tag not in tag_map:
+            result = _add_tag(client, tag)
+            # Refresh tag list to get the new UUID
+            tag_map = _get_tag_list(client)
+    
+    return tag_map
+
+def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
     changed = False
     desired_hosts = build_static_hosts(cfg)
     existing_hosts = _search_hosts(client)
@@ -194,10 +237,16 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient) -> bool:
             str(current.get("hwaddr", "")) == str(desired.get("hwaddr", "")) and
             str(current.get("host", "")) == str(desired.get("host", "")) and
             str(current.get("domain", "")) == str(desired.get("domain", "")) and
-            str(current.get("descr", "")) == str(desired.get("descr", ""))
+            str(current.get("descr", "")) == str(desired.get("descr", "")) and
+            str(current.get("set_tag", "")) == str(desired.get("set_tag", ""))
         )
 
     def _format_host_for_set(desired: dict) -> dict:
+        # Convert tags list to comma-separated UUID string
+        tags = desired.get("tags", [])
+        tag_uuids = [tag_map.get(tag, "") for tag in tags if tag in tag_map]
+        set_tag_value = ",".join(filter(None, tag_uuids))
+        
         return {
             "host": desired.get("host", ""),
             "domain": desired.get("domain", ""),
@@ -208,7 +257,7 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient) -> bool:
             "client_id": "*",
             "hwaddr": desired.get("hwaddr", ""),
             "lease_time": "",
-            "set_tag": "",
+            "set_tag": set_tag_value,
             "ignore": "0",
             "descr": desired.get("descr", ""),
             "comments": ""
@@ -351,13 +400,94 @@ def apply_dnsmasq_options(cfg, client: OpnClient) -> bool:
     return changed
 
 
+def apply_dnsmasq_tagged_options(cfg, client: OpnClient, tag_map: dict) -> bool:
+    """
+    Apply DHCP options that are tagged for specific clients.
+    Handles the expanded format with option, value, description, and force.
+    """
+    changed = False
+    existing_options = _search_options(client)
+    
+    # Index existing options by (interface, option_code, tag)
+    opt_index = {}
+    for row in existing_options:
+        code = str(row.get("option") or row.get("option6") or "")
+        iface = row.get("interface", "")
+        tag = str(row.get("tag", ""))
+        if code and iface:
+            opt_index[(iface, code, tag)] = row
+
+    for vlan_name, vlan in cfg["vlans"].items():
+        iface = cfg.get("__vlan_assignments__", {}).get(vlan_name, {}).get("interface")
+        if not iface:
+            continue
+        
+        tagged_options = vlan.get("dhcp_tagged_options", [])
+        for tagged_opt in tagged_options:
+            tag_label = tagged_opt.get("tag")
+            if not tag_label or tag_label not in tag_map:
+                continue
+            
+            tag_uuid = tag_map[tag_label]
+            options = tagged_opt.get("options", [])
+            
+            for opt in options:
+                # Handle both old dict format and new list format
+                if isinstance(opt, dict):
+                    code = str(opt.get("option", ""))
+                    value = str(opt.get("value", ""))
+                    description = str(opt.get("description", ""))
+                    force = "1" if opt.get("force", False) else "0"
+                else:
+                    # Skip invalid entries
+                    continue
+                
+                if not code:
+                    continue
+                
+                payload = {
+                    "interface": iface,
+                    "type": "set",
+                    "option": code,
+                    "option6": "",
+                    "tag": tag_uuid,
+                    "set_tag": "",
+                    "value": value,
+                    "force": force,
+                    "descr": description
+                }
+                
+                key = (iface, code, tag_uuid)
+                if key in opt_index:
+                    current_row = opt_index[key]
+                    uuid = current_row.get("uuid")
+                    # Check if update needed
+                    if (
+                        str(current_row.get("value", "")) != value or
+                        str(current_row.get("force", "0")) != force or
+                        str(current_row.get("descr", "")) != description
+                    ):
+                        _set_option(client, uuid, payload)
+                        changed = True
+                else:
+                    _add_option(client, payload)
+                    changed = True
+
+    return changed
+
 def apply_dnsmasq(cfg, client: OpnClient):
     changed = False
-    if apply_dnsmasq_hosts(cfg, client):
+    
+    # First, ensure all tags exist and get the tag map
+    tag_map = ensure_tags_exist(cfg, client)
+    
+    if apply_dnsmasq_hosts(cfg, client, tag_map):
         changed = True
     if apply_dnsmasq_ranges(cfg, client):
         changed = True
     if apply_dnsmasq_options(cfg, client):
+        changed = True
+    if apply_dnsmasq_tagged_options(cfg, client, tag_map):
         changed = True
         
     if changed:

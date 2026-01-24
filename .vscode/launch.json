@@ -11,7 +11,7 @@
       "console": "integratedTerminal",
       "justMyCode": true,
       "args": [
-        "nammane.arpa.yaml"
+        "yaml2opnsense-config/nammane.arpa.yaml"
       ],
     },
     {
@@ -22,7 +22,7 @@
       "console": "integratedTerminal",
       "sudo": true,
       "args": [
-        "nammane.arpa.yaml",
+        "yaml2opnsense-config/nammane.arpa.yaml",
         "--test",
         "eth0"
       ],
