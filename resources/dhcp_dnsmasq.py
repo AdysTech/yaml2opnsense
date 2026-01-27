@@ -231,14 +231,19 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
         if ip:
             host_index_by_ip[ip] = row
 
-    def _host_equal(current: dict, desired: dict) -> bool:        
+    def _host_equal(current: dict, desired: dict) -> bool:
+        # Convert desired tags list to UUID string for comparison
+        tags = desired.get("tags", [])
+        tag_uuids = [tag_map.get(tag, "") for tag in tags if tag in tag_map]
+        desired_set_tag = ",".join(filter(None, tag_uuids))
+        
         return (
             current.get("ip", "") == str(desired.get("ip", "")) and
             str(current.get("hwaddr", "")) == str(desired.get("hwaddr", "")) and
             str(current.get("host", "")) == str(desired.get("host", "")) and
             str(current.get("domain", "")) == str(desired.get("domain", "")) and
             str(current.get("descr", "")) == str(desired.get("descr", "")) and
-            str(current.get("set_tag", "")) == str(desired.get("set_tag", ""))
+            str(current.get("set_tag", "")) == desired_set_tag
         )
 
     def _format_host_for_set(desired: dict) -> dict:

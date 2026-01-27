@@ -152,6 +152,7 @@ def _validate_references(cfg: dict) -> None:
     if errs:
         raise ValueError("; "+"; ".join(errs))
 
+
 def load_config(path):
     with open(path, "r") as f:
         raw = yaml.safe_load(f)

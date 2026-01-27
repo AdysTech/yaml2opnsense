@@ -113,6 +113,124 @@ def _add_forward(client: OpnClient, payload: dict):
     return client.post("/api/unbound/settings/add_forward", payload)
 
 
+def build_host_overrides(cfg):
+    """
+    Build host override configurations for Unbound.
+    Converts FQDN entries to hostname + domain pairs.
+    
+    E.g., "nammane.adys" -> hostname="nammane", domain="adys"
+          "*.docker" -> hostname="*", domain="docker"
+    """
+    overrides = []
+    custom_overrides = cfg.get("host_overrides", [])
+    
+    for override in custom_overrides:
+        fqdn = override.get("hostname", "")
+        if not fqdn:
+            continue
+            
+        # Split FQDN into hostname and domain
+        parts = fqdn.rsplit(".", 1)
+        if len(parts) == 2:
+            hostname, domain = parts
+        else:
+            # No domain part, use as hostname only
+            hostname = parts[0]
+            domain = ""
+        
+        overrides.append({
+            "hostname": hostname,
+            "domain": domain,
+            "ip": override.get("ip", ""),
+            "description": override.get("description", ""),
+        })
+    
+    return overrides
+
+
+def _search_host_overrides(client: OpnClient):
+    """Fetch all existing host override entries from Unbound."""
+    try:
+        data = client.post("/api/unbound/settings/search_host_override", {})
+        return data.get("rows", [])
+    except Exception:
+        return []
+
+
+def _get_host_override(client: OpnClient, uuid: str):
+    """Get a specific host override entry by UUID."""
+    return client.get(f"/api/unbound/settings/get_host_override/{uuid}").get("host", {})
+
+
+def _set_host_override(client: OpnClient, uuid: str, payload: dict):
+    """Update an existing host override entry."""
+    return client.post(f"/api/unbound/settings/set_host_override/{uuid}", payload)
+
+
+def _add_host_override(client: OpnClient, payload: dict):
+    """Add a new host override entry."""
+    return client.post("/api/unbound/settings/add_host_override", payload)
+
+
+def apply_unbound_host_overrides(cfg, client: OpnClient):
+    """
+    Idempotently apply host override configurations to Unbound.
+    - Adds new host overrides
+    - Updates existing overrides when IP differs
+    - Triggers service reconfigure if any change
+    
+    Note: Does not remove overrides not in config (to avoid breaking user-added overrides).
+    """
+    desired_overrides = build_host_overrides(cfg)
+    if not desired_overrides:
+        return False
+
+    changed = False
+    existing_overrides = _search_host_overrides(client)
+    # Index by (hostname, domain) tuple
+    override_index = {
+        (row.get("hostname", ""), row.get("domain", "")): row
+        for row in existing_overrides
+    }
+
+    def _override_equal(current: dict, desired: dict) -> bool:
+        """Check if current override matches desired configuration."""
+        return str(current.get("server", "")) == desired.get("ip", "")
+
+    # Add/update overrides
+    for override in desired_overrides:
+        hostname = override["hostname"]
+        domain = override["domain"]
+        key = (hostname, domain)
+
+        payload = {
+            "host": {
+                "enabled": "1",
+                "hostname": hostname,
+                "domain": domain,
+                "rr": "A",
+                "mxprio": "",
+                "mx": "",
+                "server": override["ip"],
+                "txtdata": "",
+                "ttl": "",
+                "description": override.get("description", ""),
+            }
+        }
+
+        if key in override_index:
+            current = override_index[key]
+            if not _override_equal(current, override):
+                uuid = current.get("uuid")
+                _set_host_override(client, uuid, payload)
+                changed = True
+        else:
+            _add_host_override(client, payload)
+            changed = True
+
+    return changed
+
+
 def apply_unbound_forwards(cfg, client: OpnClient):
     """
     Idempotently apply DNS forward configurations to Unbound.
@@ -124,7 +242,7 @@ def apply_unbound_forwards(cfg, client: OpnClient):
     """
     desired_forwards = build_dns_forwards(cfg)
     if not desired_forwards:
-        return
+        return False
 
     changed = False
     existing_forwards = _search_forwards(client)
@@ -165,5 +283,16 @@ def apply_unbound_forwards(cfg, client: OpnClient):
             _add_forward(client, payload)
             changed = True
 
-    if changed:
+    return changed
+
+
+def apply_unbound(cfg, client: OpnClient):
+    """
+    Apply all Unbound configurations: forwards and host overrides.
+    Triggers service reconfigure only once if any changes were made.
+    """
+    forwards_changed = apply_unbound_forwards(cfg, client)
+    overrides_changed = apply_unbound_host_overrides(cfg, client)
+    
+    if forwards_changed or overrides_changed:
         client.post("/api/unbound/service/reconfigure")

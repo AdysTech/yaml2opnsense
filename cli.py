@@ -3,9 +3,10 @@ from core.config_loader import load_config
 from core.client import OpnClient
 from resources.interfaces import apply_interfaces, validate_vlan_assignments
 from resources.dhcp_dnsmasq import apply_dnsmasq
-from resources.unbound import apply_unbound_forwards
+from resources.unbound import apply_unbound
 from resources.firewall import apply_firewall
 from resources.freeradius import apply_freeradius
+from resources.haproxy import apply_haproxy
 
 
 def apply(path, test_interface=None):
@@ -33,10 +34,10 @@ def apply(path, test_interface=None):
         )
 
     apply_dnsmasq(cfg, client)  # static leases, DHCP config as needed
-    apply_unbound_forwards(cfg, client)  # DNS forwards for VLAN zones to dnsmasq
+    apply_unbound(cfg, client)  # DNS forwards and host overrides
     apply_freeradius(cfg, client)  # FreeRADIUS users (MAC/username, VLAN)
-    # apply_firewall(cfg, client)     # rules based on policies
-
+    apply_haproxy(cfg, client)      # HAProxy load balancer configuration
+    apply_firewall(cfg, client)     # rules based on policies
     # Run validation tests if requested
     if test_interface:
         from validator.validator import VLANValidator

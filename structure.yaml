@@ -22,6 +22,17 @@ your.domain.name:
       port: 53
       description: "Internal DNS"
 
+  # --- Unbound DNS Host Overrides ---
+  # Defines host overrides in Unbound DNS (A records).
+  # FQDN is automatically split into hostname + domain for the API.
+  host_overrides:
+    - hostname: "service.domain"  # FQDN - will be split to hostname="service", domain="domain"
+      ip: "192.168.1.100"
+      description: "Internal service"
+    - hostname: "*.wildcard"       # Wildcard hostname support
+      ip: "192.168.1.200"
+      description: "Wildcard DNS entry"
+
   # --- Connectivity Tests ---
   # Defines DNS and connectivity validation tests used by the validator.
   # These tests are applied to all VLANs during validation.
@@ -114,3 +125,87 @@ your.domain.name:
       allow:
         - adguard
       deny_internet: true # Keyword to block all internet access
+
+  # --- HAProxy Configuration ---
+  # Defines HAProxy load balancer for high availability and load distribution.
+  haproxy:
+    enabled: true
+    bind_address: "192.168.21.1"  # IP address where frontends bind
+    
+    stats:
+      enabled: true
+      uri: /haproxy_stats
+      refresh: 10s
+    
+    # Backend server pools
+    backends:
+      app_backend:
+        mode: http                # http or tcp
+        balance: roundrobin       # roundrobin, leastconn, source
+        
+        # Health check configuration
+        health_check:
+          method: HEAD            # HTTP method (for HTTP mode)
+          uri: /health            # Health check endpoint (for HTTP mode)
+          port: 8080              # Health check port
+          check_interval: 5s      # Check frequency
+        
+        # Service port for all servers in this backend
+        service:
+          port: 80
+        
+        # Optional: HAProxy backend options
+        options:
+          - forwardfor
+          - http-server-close
+        
+        # Optional: HTTP request header manipulation
+        http_request:
+          - action: set-header    # set-header or add-header
+            name: X-Real-IP
+            value: "%[src]"
+          - action: add-header
+            name: X-Forwarded-Proto
+            value: "https"
+        
+        # Optional: Custom timeouts
+        timeout_tunnel: 1h        # For WebSocket connections
+        
+        # Backend servers (must reference hostnames from static_leases)
+        servers:
+          - name: server1         # Hostname from static_leases
+          - name: server2
+          - name: server3
+      
+      tcp_backend:
+        mode: tcp
+        balance: leastconn
+        health_check:
+          port: 3306              # For TCP, only port is needed
+          check_interval: 10s
+        service:
+          port: 3306
+        servers:
+          - name: db-server1
+          - name: db-server2
+    
+    # Frontend listeners
+    frontends:
+      web_http:
+        bind_port: 80
+        mode: http
+        default_backend: app_backend
+        stats_enabled: true       # Enable stats on this frontend
+      
+      web_https:
+        bind_port: 443
+        mode: http
+        ssl: true                 # Enable SSL/TLS
+        ssl_cert: "example.com"   # Certificate name (linked from Opnsense Trust store)
+        default_backend: app_backend
+        stats_enabled: true
+      
+      mysql:
+        bind_port: 3306
+        mode: tcp
+        default_backend: tcp_backend
