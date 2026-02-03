@@ -40,7 +40,7 @@ def build_static_hosts(cfg):
                 "host": entry["hostname"],
                 "domain":entry.get("domain", domain),
                 "ip": v.get("gateway") if entry.get("ip") == "gateway" else entry.get("ip"),
-                "hwaddr": entry.get("mac",""),
+                "hwaddr": entry.get("mac","").upper(),
                 "descr": entry.get("description",""),
                 "tags": entry.get("tags", []),
             })
@@ -219,17 +219,12 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
     desired_hosts = build_static_hosts(cfg)
     existing_hosts = _search_hosts(client)
     
-    def _selected_keys(value):
-        if isinstance(value, dict):
-            return [k for k, v in value.items() if isinstance(v, dict) and v.get("selected")]
-        return []
-    
-    # Index by IP address for reliable matching
-    host_index_by_ip = {}
-    for row in existing_hosts:      
-        ip = row.get("ip", "")
-        if ip:
-            host_index_by_ip[ip] = row
+    # Index by MAC address for reliable matching
+    host_index = {}
+    for host in existing_hosts:      
+        key = host.get("hwaddr","").upper() if host.get("hwaddr","") else host.get("ip", "")
+        if key:
+            host_index[key] = host
 
     def _host_equal(current: dict, desired: dict) -> bool:
         # Convert desired tags list to UUID string for comparison
@@ -239,7 +234,7 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
         
         return (
             current.get("ip", "") == str(desired.get("ip", "")) and
-            str(current.get("hwaddr", "")) == str(desired.get("hwaddr", "")) and
+            str(current.get("hwaddr", "")).upper() == str(desired.get("hwaddr", "")).upper() and
             str(current.get("host", "")) == str(desired.get("host", "")) and
             str(current.get("domain", "")) == str(desired.get("domain", "")) and
             str(current.get("descr", "")) == str(desired.get("descr", "")) and
@@ -269,11 +264,10 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
         }
 
     for host in desired_hosts:
-        ip = host.get("ip", "")
-        
-        # Match by IP address only
-        if ip in host_index_by_ip:
-            current = host_index_by_ip[ip]
+        key = host.get("hwaddr","").upper() if host.get("hwaddr","") else host.get("ip", "")
+        # Match by MAC address only
+        if key in host_index:
+            current = host_index[key]
             if not _host_equal(current, host):
                 _set_host(client, current.get("uuid"), _format_host_for_set(host))
                 changed = True
@@ -358,7 +352,9 @@ def apply_dnsmasq_options(cfg, client: OpnClient) -> bool:
     for row in existing_options:
         code = str(row.get("option") or row.get("option6") or "")
         iface = row.get("interface", "")
-        if code and iface is not None:
+        tag = row.get("tag", "")
+        # Only index non-tagged options (default options)
+        if code and iface is not None and not tag:
             opt_index[(iface, code)] = row
 
     def _normalize_option_type(current_type) -> str:

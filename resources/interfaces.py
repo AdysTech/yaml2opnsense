@@ -5,8 +5,20 @@ from core.client import OpnClient
 def build_desired_interfaces(cfg):
     """
     Build two lists:
-      - desired_vlans: VLANs that must be created (tagged)
-      - untagged: physical interfaces that should NOT become VLANs
+      - desired_vlans: Tagged VLANs that must be created as vlanXX devices
+      - untagged: Physical interfaces that should NOT become VLANs
+
+    IMPORTANT DISTINCTION:
+    - Tagged VLAN (uses 'parent'): Creates vlanXX subinterface with 802.1q tag
+    - Untagged interface (uses 'interface'): Direct physical NIC configuration
+
+    Both types require a 'id' field in the YAML config for:
+      - Logical grouping
+      - Firewall rule references
+      - Service configuration
+
+    The 'id' for untagged interfaces is NOT used as an 802.1q tag; it's purely
+    for organizational purposes within the yaml2opnsense system.
     """
     vlans = cfg["vlans"]
 
@@ -14,11 +26,12 @@ def build_desired_interfaces(cfg):
     untagged = []
 
     for name, v in vlans.items():
-        # Tagged VLAN case
+        # Tagged VLAN case: creates vlanXX device
         if "parent" in v:
             item = {
                 "name": name,
                 "tag": v["id"],
+                "vlan_id": v["id"],  # Include for consistency
                 "parent": v["parent"],  # vtnet2, etc.
                 "cidr": v["cidr"],
                 "gateway": v["gateway"],
@@ -30,10 +43,11 @@ def build_desired_interfaces(cfg):
             desired_vlans.append(item)
             continue
 
-        # Untagged (native) network case
+        # Untagged (native) network case: direct physical interface
         if "interface" in v:
             untagged.append({
                 "name": name,
+                "vlan_id": v["id"],  # Logical ID for firewall rules, not 802.1q tag
                 "device": v["interface"],  # physical interface (e.g., vtnet3)
                 "cidr": v["cidr"],
                 "gateway": v["gateway"],
@@ -220,16 +234,24 @@ def _get_assigned_devices(client: OpnClient):
 
 
 def validate_vlan_assignments(cfg, client: OpnClient):
-    """Validate that each desired tagged VLAN has been assigned to an optX interface.
+    """Validate that each desired network (tagged VLAN or untagged interface) has been assigned.
 
-    Returns a list of human-readable VLAN identifiers missing assignment.
+    Returns a list of human-readable network identifiers missing assignment.
+    
+    This function checks both:
+    - Tagged VLANs (created as vlanXX devices)
+    - Untagged physical interfaces (direct NIC configuration)
+    
+    Both types get their VLAN ID stored in assignments for firewall rule references.
     """
-    desired_vlans, _untagged = build_desired_interfaces(cfg)
+    desired_vlans, untagged = build_desired_interfaces(cfg)
     # fetch full overview to inspect vlan parent/tag and current identifier (optX)
     assigned_networks = _get_assigned_devices(client)
 
     missing = []
     assignments = {}
+    
+    # Check tagged VLANs
     for vlan in desired_vlans:
         found = False 
         for a in assigned_networks: 
@@ -237,15 +259,32 @@ def validate_vlan_assignments(cfg, client: OpnClient):
                 found = True 
                 break 
         if not found: 
-            missing.append(f"vlan {vlan['name']} not assigned to optX")
+            missing.append(f"vlan {vlan['name']} (tagged, ID {vlan['vlan_id']}) not assigned to optX")
         else:
-            assignments[vlan["name"]] = {"device": a["device"], "interface": a["interface"],"network": a["network"]}
+            assignments[vlan["name"]] = {
+                "device": a["device"], 
+                "interface": a["interface"],
+                "network": a["network"],
+                "vlan_id": vlan["vlan_id"],
+                "type": "tagged"
+            }
 
-    for vlan in _untagged:
+    # Check untagged physical interfaces
+    for iface in untagged:
+        found = False
         for a in assigned_networks: 
-            if vlan["network"] == a["network"]: 
-                assignments[vlan["name"]] = {"device": a["device"], "interface": a["interface"],"network": a["network"]}
+            if iface["network"] == a["network"]: 
+                assignments[iface["name"]] = {
+                    "device": a["device"], 
+                    "interface": a["interface"],
+                    "network": a["network"],
+                    "vlan_id": iface["vlan_id"],  # Logical ID for firewall rules
+                    "type": "untagged"
+                }
+                found = True
                 break
+        if not found:
+            missing.append(f"interface {iface['name']} (untagged, logical ID {iface['vlan_id']}) not assigned")
             
     cfg["__missing_vlan_assignments__"] = missing
     cfg["__vlan_assignments__"] = assignments

@@ -48,17 +48,17 @@ def build_dns_forwards(cfg):
     
     # Add custom forwards first (e.g., for AdGuard, external DNS)
     custom_forwards = cfg.get("dns_forwards", [])
-    for fwd in custom_forwards:
-        forwards.append({
-            "domain": fwd.get("domain", ""),
-            "server": fwd["server"],
-            "port": str(fwd.get("port", "53")),
-            "description": fwd.get("description", ""),
-        })
+    if custom_forwards:
+        for fwd in custom_forwards:
+            forwards.append({
+                "domain": fwd.get("domain", ""),
+                "server": fwd["server"],
+                "port": str(fwd.get("port", "53")),
+                "description": fwd.get("description", ""),
+            })
     
     # Add VLAN-based forwards
-    if domain:
-        
+    if domain:        
         # Forward lookup: domain -> 127.0.0.1:53053
         forwards.append(
             {
@@ -130,13 +130,24 @@ def build_host_overrides(cfg):
             continue
             
         # Split FQDN into hostname and domain
-        parts = fqdn.rsplit(".", 1)
-        if len(parts) == 2:
-            hostname, domain = parts
+        # Handle wildcards: "*.domain.com" -> hostname="*", domain="domain.com"
+        if fqdn.startswith("*."):
+            hostname = "*"
+            domain = fqdn[2:]  # Everything after "*."
         else:
-            # No domain part, use as hostname only
-            hostname = parts[0]
-            domain = ""
+            parts = fqdn.split(".")
+            if len(parts) >= 3:
+                # Keep last 2 parts as domain (TLD + domain), rest as hostname
+                # E.g., "abcd.123.xyz.com" -> hostname="abcd.123", domain="xyz.com"
+                hostname = ".".join(parts[:-2])
+                domain = ".".join(parts[-2:])
+            elif len(parts) == 2:
+                # E.g., "host.domain" -> hostname="host", domain="domain"
+                hostname, domain = parts
+            else:
+                # No domain part, use as hostname only
+                hostname = parts[0]
+                domain = ""
         
         overrides.append({
             "hostname": hostname,
