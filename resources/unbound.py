@@ -204,10 +204,6 @@ def apply_unbound_host_overrides(cfg, client: OpnClient):
         for row in existing_overrides
     }
 
-    def _override_equal(current: dict, desired: dict) -> bool:
-        """Check if current override matches desired configuration."""
-        return str(current.get("server", "")) == desired.get("ip", "")
-
     # Add/update overrides
     for override in desired_overrides:
         hostname = override["hostname"]
@@ -231,7 +227,7 @@ def apply_unbound_host_overrides(cfg, client: OpnClient):
 
         if key in override_index:
             current = override_index[key]
-            if not _override_equal(current, override):
+            if str(current.get("server", "")) != override.get("ip", ""):
                 uuid = current.get("uuid")
                 _set_host_override(client, uuid, payload)
                 changed = True

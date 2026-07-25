@@ -34,6 +34,8 @@ def build_haproxy_config(cfg):
         backend_port = str(backend_def.get("service", {}).get("port", "80"))
         
         for server in backend_def.get("servers", []):
+            if server is None:
+                continue
             server_name = server.get("name", "")
             address = server.get("address", "")
             
@@ -116,20 +118,21 @@ def build_haproxy_config(cfg):
             action_full_name = f"{backend_name}_{action_type}_{action_name}_{idx}"
             
             # Build action payload based on OPNsense structure
+            # type = category (http-request/http-response/...); http_request_action = the verb;
+            # http_request_option carries the verb's arguments as a single string.
             action_payload = {
                 "name": action_full_name,
                 "description": f"{action_type} {action_name} for {backend_name}",
-                "type": f"http-request_{action_type}",
+                "type": "http-request",
+                "http_request_action": action_type,
                 "backend_name": backend_name,  # Track which backend this belongs to
             }
             
             # Add type-specific fields
-            if action_type == "set-header":
-                action_payload["http_request_set_header_name"] = action_name
-                action_payload["http_request_set_header_content"] = action_value
-            elif action_type == "add-header":
-                action_payload["http_request_add_header_name"] = action_name
-                action_payload["http_request_add_header_content"] = action_value
+            if action_type in ("set-header", "add-header", "replace-header", "replace-value"):
+                action_payload["http_request_option"] = f"{action_name} {action_value}".strip()
+            elif action_type == "del-header":
+                action_payload["http_request_option"] = action_name
             
             config["actions"].append(action_payload)
     
@@ -141,7 +144,9 @@ def build_haproxy_config(cfg):
         # Get linked servers - use unique names matching what we created
         linked_servers = []
         for server in backend_def.get("servers", []):
-            linked_servers.append( f"{server.get("name", "")}_{backend_name}")
+            if server is None:
+                continue
+            linked_servers.append(f"{server.get('name', '')}_{backend_name}")
         
         backend = {
             "name": backend_name,
@@ -296,6 +301,86 @@ def _add_frontend(client: OpnClient, payload: dict):
 
 def _set_frontend(client: OpnClient, uuid: str, payload: dict):
     return client.post(f"/api/haproxy/settings/setFrontend/{uuid}", {"frontend": payload})
+
+# --- Delete helpers ---
+
+def _delete_server(client: OpnClient, uuid: str):
+    return client.post(f"/api/haproxy/settings/delServer/{uuid}")
+
+
+def _delete_healthcheck(client: OpnClient, uuid: str):
+    return client.post(f"/api/haproxy/settings/delHealthcheck/{uuid}")
+
+
+def _delete_action(client: OpnClient, uuid: str):
+    return client.post(f"/api/haproxy/settings/delAction/{uuid}")
+
+
+def _delete_backend(client: OpnClient, uuid: str):
+    return client.post(f"/api/haproxy/settings/delBackend/{uuid}")
+
+
+def _delete_frontend(client: OpnClient, uuid: str):
+    return client.post(f"/api/haproxy/settings/delFrontend/{uuid}")
+
+
+# --- Cleanup functions for stale resources ---
+
+def _cleanup_deleted_servers(haproxy_config, client: OpnClient, server_uuid_map: dict):
+    """Delete servers that exist in OPNsense but not in desired config.
+    
+    Servers are matched by (address, port) tuple since multiple backends
+    can reference the same server IP.
+    """
+    existing_servers = _search_servers(client)
+    # Build set of desired (address, port) keys from config
+    desired_keys = {(srv["address"], srv["port"]) for srv in haproxy_config["servers"]}
+    
+    for srv in existing_servers:
+        addr = srv.get("address", "")
+        port = srv.get("port", "")
+        if (addr, port) not in desired_keys:
+            _delete_server(client, srv["uuid"])
+
+
+def _cleanup_deleted_healthchecks(haproxy_config, client: OpnClient, healthcheck_uuid_map: dict):
+    """Delete healthchecks that exist in OPNsense but not in desired config."""
+    existing_healthchecks = _search_healthchecks(client)
+    desired_names = {hc["name"] for hc in haproxy_config["healthchecks"]}
+    
+    for hc in existing_healthchecks:
+        if hc.get("name") not in desired_names:
+            _delete_healthcheck(client, hc["uuid"])
+
+
+def _cleanup_deleted_actions(haproxy_config, client: OpnClient, action_uuid_map_by_backend: dict):
+    """Delete actions that exist in OPNsense but not in desired config."""
+    existing_actions = _search_actions(client)
+    desired_names = {action["name"] for action in haproxy_config["actions"]}
+    
+    for action in existing_actions:
+        if action.get("name") not in desired_names:
+            _delete_action(client, action["uuid"])
+
+
+def _cleanup_deleted_backends(haproxy_config, client: OpnClient, backend_uuid_map: dict):
+    """Delete backends that exist in OPNsense but not in desired config."""
+    existing_backends = _search_backends(client)
+    desired_names = {backend["name"] for backend in haproxy_config["backends"]}
+    
+    for backend in existing_backends:
+        if backend.get("name") not in desired_names:
+            _delete_backend(client, backend["uuid"])
+
+
+def _cleanup_deleted_frontends(haproxy_config, client: OpnClient, frontend_uuid_map: dict):
+    """Delete frontends that exist in OPNsense but not in desired config."""
+    existing_frontends = _search_frontends(client)
+    desired_names = {fe["name"] for fe in haproxy_config["frontends"]}
+    
+    for fe in existing_frontends:
+        if fe.get("name") not in desired_names:
+            _delete_frontend(client, fe["uuid"])
 
 
 def _sync_servers(haproxy_config, client: OpnClient):
@@ -529,11 +614,12 @@ def _sync_backends(haproxy_config, client: OpnClient, server_uuid_map, healthche
 
 def _sync_frontends(haproxy_config, client: OpnClient, backend_uuid_map):
     """
-    Sync HAProxy frontends. Returns changed flag.
+    Sync HAProxy frontends. Returns (changed, frontend_uuid_map).
     """
     changed = False
     existing_frontends = _search_frontends(client)
     frontend_index = {f.get("name"): f for f in existing_frontends}
+    frontend_uuid_map = {}
     
     # Build certificate name → UUID map from frontend options
     options = _get_frontend_options(client)
@@ -575,6 +661,7 @@ def _sync_frontends(haproxy_config, client: OpnClient, backend_uuid_map):
             # Update existing
             current = frontend_index[name]
             uuid = current.get("uuid")
+            frontend_uuid_map[name] = uuid
             
             if (
                 str(current.get("bind")) != str(frontend.get("bind")) or
@@ -588,27 +675,50 @@ def _sync_frontends(haproxy_config, client: OpnClient, backend_uuid_map):
                 changed = True
         else:
             # Add new
-            _add_frontend(client, frontend)
+            result = _add_frontend(client, frontend)
+            if result and result.get("uuid"):
+                frontend_uuid_map[name] = result["uuid"]
             changed = True
     
-    return changed
+    # Refresh list if changed
+    if changed:
+        existing_frontends = _search_frontends(client)
+        frontend_index = {f.get("name"): f for f in existing_frontends}
+        for name, fe in frontend_index.items():
+            if name in [f["name"] for f in haproxy_config["frontends"]]:
+                frontend_uuid_map[name] = fe.get("uuid")
+    
+    return changed, frontend_uuid_map
 
 
 def apply_haproxy(cfg, client: OpnClient):
     """
     Apply HAProxy configuration to OPNsense idempotently.
+    
+    Syncs are performed in forward dependency order (leaf nodes first, then dependents).
+    Cleanups are performed in REVERSE dependency order (top-level consumers first,
+    then their dependencies) to avoid foreign key violations:
+    - Frontends reference backends by UUID
+    - Backends reference servers, actions, and healthchecks by UUID
     """
     haproxy_config = build_haproxy_config(cfg)
     
     if not haproxy_config:
         return  # HAProxy not enabled
     
-    # Sync configuration in dependency order: servers → healthchecks → actions → backends → frontends
+    # --- Sync phase: forward dependency order ---
     servers_changed, server_uuid_map = _sync_servers(haproxy_config, client)
     healthchecks_changed, healthcheck_uuid_map = _sync_healthchecks(haproxy_config, client)
     actions_changed, action_uuid_map_by_backend = _sync_actions(haproxy_config, client)
     backends_changed, backend_uuid_map = _sync_backends(haproxy_config, client, server_uuid_map, healthcheck_uuid_map, action_uuid_map_by_backend)
-    frontends_changed = _sync_frontends(haproxy_config, client, backend_uuid_map)
+    frontends_changed, frontend_uuid_map = _sync_frontends(haproxy_config, client, backend_uuid_map)
+    
+    # --- Cleanup phase: REVERSE dependency order (top-level consumers first) ---
+    _cleanup_deleted_frontends(haproxy_config, client, frontend_uuid_map)
+    _cleanup_deleted_backends(haproxy_config, client, backend_uuid_map)
+    _cleanup_deleted_actions(haproxy_config, client, action_uuid_map_by_backend)
+    _cleanup_deleted_healthchecks(haproxy_config, client, healthcheck_uuid_map)
+    _cleanup_deleted_servers(haproxy_config, client, server_uuid_map)
     
     # Reconfigure if anything changed
     if servers_changed or healthchecks_changed or actions_changed or backends_changed or frontends_changed:
