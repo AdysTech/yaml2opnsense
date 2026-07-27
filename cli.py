@@ -37,7 +37,7 @@ def apply(path, test_interface=None):
     apply_unbound(cfg, client)  # DNS forwards and host overrides
     apply_freeradius(cfg, client)  # FreeRADIUS users (MAC/username, VLAN)
     apply_haproxy(cfg, client)      # HAProxy load balancer configuration
-    apply_firewall(cfg, client)     # rules based on policies
+    # apply_firewall(cfg, client)     # rules based on policies
     # Run validation tests if requested
     if test_interface:
         from validator.validator import VLANValidator

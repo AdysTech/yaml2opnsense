@@ -168,8 +168,10 @@ your.domain.name:
             name: X-Forwarded-Proto
             value: "https"
         
-        # Optional: Custom timeouts
-        timeout_tunnel: 1h        # For WebSocket connections
+        # Optional: Custom timeouts (HAProxy tuning settings)
+        timeout_connect: 10s      # Maximum time to wait for a connection to be established        
+        timeout_server: 300s      # Wait for server to respond
+        timeout_tunnel: 1h        # For WebSocket/L4 tunnel connections
         
         # Backend servers (must reference hostnames from static_leases)
         servers:
@@ -203,6 +205,7 @@ your.domain.name:
         ssl: true                 # Enable SSL/TLS
         ssl_cert: "example.com"   # Certificate name (linked from Opnsense Trust store)
         default_backend: app_backend
+        timeout_client: 300s      # Wait for client to send data
         stats_enabled: true
       
       mysql:

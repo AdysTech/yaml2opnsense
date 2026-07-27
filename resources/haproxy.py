@@ -169,10 +169,27 @@ def build_haproxy_config(cfg):
         if "http-server-close" in options:
             backend["httpClose"] = "1"
         
-        # Timeout
+        # Timeouts
+        timeout_connect = backend_def.get("timeout_connect")
+        if timeout_connect:
+            backend["tuning_timeoutConnect"] = str(timeout_connect)
+        
+        timeout_server = backend_def.get("timeout_server")
+        if timeout_server:
+            backend["tuning_timeoutServer"] = str(timeout_server)
+        
+        # timeout_tunnel must be injected via customOptions since OPNsense API
+        # doesn't have a dedicated tuning_timeoutTunnel field.
+        # See: https://github.com/opnsense/plugins/issues/5376
         timeout_tunnel = backend_def.get("timeout_tunnel")
         if timeout_tunnel:
-            backend["tuning_timeoutTunnel"] = str(timeout_tunnel)
+            # Build customOptions, appending timeout tunnel if not already present
+            existing_custom = backend_def.get("customOptions", "")
+            if existing_custom:
+                custom_options = f"{existing_custom};timeout tunnel {timeout_tunnel}"
+            else:
+                custom_options = f"timeout tunnel {timeout_tunnel}"
+            backend["customOptions"] = custom_options
         
         config["backends"].append(backend)
     
@@ -508,8 +525,7 @@ def _sync_actions(haproxy_config, client: OpnClient):
             action_uuid_map_by_backend[backend_name] = []
         
         # Build API payload without backend_name helper field
-        api_payload = {k: v for k, v in action.items() if k != "backend_name"}
-        
+        api_payload = {k: v for k, v in action.items() if k != "backend_name"}        
         if name in action_index:
             # Update existing
             current = action_index[name]
@@ -591,7 +607,11 @@ def _sync_backends(haproxy_config, client: OpnClient, server_uuid_map, healthche
             if (
                 str(current.get("mode")) != str(backend.get("mode")) or
                 str(current.get("balance")) != str(backend.get("balance")) or
-                str(current.get("linkedServers")) != backend.get("linkedServers", "")
+                str(current.get("linkedServers")) != backend.get("linkedServers", "") or
+                str(current.get("tuning_timeoutConnect")) != backend.get("tuning_timeoutConnect", "") or
+                str(current.get("tuning_timeoutServer")) != backend.get("tuning_timeoutServer", "") or
+                str(current.get("tuning_timeoutTunnel")) != backend.get("tuning_timeoutTunnel", "") or
+                str(current.get("tuning_timeoutCheck")) != backend.get("tuning_timeoutCheck", "")
             ):
                 _set_backend(client, uuid, backend)
                 changed = True

@@ -1,179 +1,93 @@
 from core.client import OpnClient
 
 
-def build_zones(cfg):
-    zones = {}
-    for name, v in cfg["vlans"].items():
-        zones[name] = {
-            "name": name,
-            "network": v["cidr"],
-        }
-    return zones
-def resolve_service(cfg, service_name):
-    svc = cfg["services"].get(service_name)
-    if not svc:
-        raise KeyError(f"Unknown service '{service_name}'")
-    return svc["ip"], svc["ports"]
-
-def build_firewall_rules(cfg):
-    zones = build_zones(cfg)
-    policies = cfg.get("policies", {})
-    assignments = cfg.get("__vlan_assignments__", {})
-    services = cfg.get("services", {})
-    wan_iface = cfg.get("wan_interface")  # e.g. "opt2"
-
-    rules = []
-
-    for zone_name, policy in policies.items():
-        src_alias = f"{zone_name}_net"
-
-        # Interface for this zone
-        zone_iface = assignments.get(zone_name, {}).get("interface")
-        if not zone_iface:
-            continue  # skip unassigned VLANs
-
-        #
-        # ALLOW RULES
-        #
-        for target in policy.get("allow", []):
-            #
-            # 1. Allow → Internet (WAN)
-            #
-            if target == "internet":
-                rules.append({
-                    "type": "pass",
-                    "interface": zone_iface,
-                    "direction": "in",
-                    "ipprotocol": "inet",
-                    "protocol": "any",
-                    "quick": "yes",
-                    "statetype": "keep state",
-                    "src": src_alias,
-                    "dst": wan_iface,  # WAN interface name, not "any"
-                    "descr": f"{zone_name} → internet",
-                })
-                continue
-
-            #
-            # 2. Allow → Service (host + ports)
-            #
-            if target in services:
-                svc = services[target]
-                host_alias = f"{target}_host"
-                ports = svc.get("ports", [])
-
-                for port in ports:
-                    rules.append({
-                        "type": "pass",
-                        "interface": zone_iface,
-                        "direction": "in",
-                        "ipprotocol": "inet",
-                        "protocol": "any",
-                        "quick": "yes",
-                        "statetype": "keep state",
-                        "src": src_alias,
-                        "dst": host_alias,
-                        "dst_port": str(port),
-                        "descr": f"{zone_name} → {target}_{port}",
-                    })
-                continue
-
-            #
-            # 3. Allow → Another zone
-            #
-            if target in zones:
-                dst_alias = f"{target}_net"
-                rules.append({
-                    "type": "pass",
-                    "interface": zone_iface,
-                    "direction": "in",
-                    "ipprotocol": "inet",
-                    "protocol": "any",
-                    "quick": "yes",
-                    "statetype": "keep state",
-                    "src": src_alias,
-                    "dst": dst_alias,
-                    "descr": f"{zone_name} → {target}",
-                })
-                continue
-
-        #
-        # DENY RULES
-        #
-        for target in policy.get("deny", []):
-            if target in zones:
-                dst_alias = f"{target}_net"
-                rules.append({
-                    "type": "block",
-                    "interface": zone_iface,
-                    "direction": "in",
-                    "ipprotocol": "inet",
-                    "protocol": "any",
-                    "quick": "yes",
-                    "statetype": "keep state",
-                    "src": src_alias,
-                    "dst": dst_alias,
-                    "descr": f"{zone_name} x {target}",
-                })
-
-        #
-        # SPECIAL: deny_internet
-        #
-        if policy.get("deny_internet"):
-            rules.append({
-                "type": "block",
-                "interface": zone_iface,
-                "direction": "in",
-                "ipprotocol": "inet",
-                "protocol": "any",
-                "quick": "yes",
-                "statetype": "keep state",
-                "src": src_alias,
-                "dst": wan_iface,
-                "descr": f"{zone_name} deny internet",
-            })
-
-    return rules
-
-
-
 def build_aliases(cfg):
+    """
+    Build firewall aliases from service definitions.
+    Returns dict of alias_name -> alias_data.
+    
+    Supports both hostnames (resolved from static_leases) and IP addresses.
+    """
     aliases = {}
+    services = cfg.get("services", {})
+    vlans = cfg.get("vlans", {})
+    unmanaged = cfg.get("unmanaged_local_networks", [])
+    
+    # Build hostname-to-IP map from static_leases
+    hostname_ip_map = {}
+    for vlan_name, vlan in vlans.items():
+        for lease_name, lease in vlan.get("static_leases", {}).items():
+            hostname = lease.get("hostname")
+            ip = vlan.get("gateway") if lease.get("ip") == "gateway" else lease.get("ip")
+            if hostname and ip:
+                hostname_ip_map[hostname] = ip
 
-    #
-    # 1. Service aliases (host + ports)
-    #
-    for name, svc in cfg.get("services", {}).items():
-        ip = svc["ip"]
-        ports = svc.get("ports", [])
+    for service_name, service_def in services.items():
+        # Skip special sections
+        if service_name in ["floating_rules"]:
+            continue
 
-        # Host alias
-        aliases[f"{name}_host"] = {
-            "name": f"{name}_host",
-            "type": "host",
-            "content": ip,
-            "descr": f"Host alias for {name}",
-        }
-
-        # Port alias (only if ports exist)
-        if ports:
-            aliases[f"{name}_ports"] = {
-                "name": f"{name}_ports",
-                "type": "port",
-                "content": "\n".join(str(p) for p in ports),
-                "descr": f"Port alias for {name}",
+        # Host aliases - resolve hostnames to IPs
+        if "hosts" in service_def:
+            hosts = service_def["hosts"]
+            resolved_hosts = []
+            
+            for host in (hosts if isinstance(hosts, list) else [hosts]):
+                # Try to resolve hostname to IP
+                resolved_ip = hostname_ip_map.get(str(host))
+                if resolved_ip:
+                    resolved_hosts.append(resolved_ip)
+                else:
+                    # Not a known hostname, keep as-is (could be IP or external hostname)
+                    resolved_hosts.append(str(host))
+            
+            content = "\n".join(resolved_hosts)
+            
+            aliases[f"{service_name}_hosts"] = {
+                "name": f"{service_name}_hosts",
+                "type": "host",
+                "content": content,
+                "descr": f"Host alias for {service_name}",
             }
 
-    #
-    # 2. VLAN network aliases
-    #
-    for name, v in cfg["vlans"].items():
-        aliases[f"{name}_net"] = {
-            "name": f"{name}_net",
-            "type": "network",
-            "content": v["cidr"],
-            "descr": f"Network alias for {name}",
-        }
+        # Port aliases
+        if "ports" in service_def:
+            ports = service_def["ports"]
+            content = "\n".join(str(p) for p in ports) if isinstance(ports, list) else str(ports)
+            
+            aliases[f"{service_name}_ports"] = {
+                "name": f"{service_name}_ports",
+                "type": "port",
+                "content": content,
+                "descr": f"Port alias for {service_name}",
+            }
+
+        # Special handling for local_private_networks
+        if service_name == "local_private_networks":
+            networks = []
+            
+            # Check if it has vlans list
+            if isinstance(service_def, list):
+                for item in service_def:
+                    if isinstance(item, dict) and "vlans" in item:
+                        # Add CIDRs from specified VLANs
+                        for vlan_name in item["vlans"]:
+                            vlan_def = vlans.get(vlan_name, {})
+                            cidr = vlan_def.get("cidr")
+                            if cidr:
+                                networks.append(cidr)
+                    elif item == "unmanaged_local_networks":
+                        # Add unmanaged networks
+                        networks.extend(unmanaged)
+            
+            if networks:
+                content = "\n".join(networks)
+                aliases["local_private_networks"] = {
+                    "name": "local_private_networks",
+                    "type": "network",
+                    "content": content,
+                    "descr": "All private local networks",
+                }
 
     return aliases
 
@@ -189,6 +103,131 @@ def _search_aliases(client: OpnClient):
 
 def _get_alias(client: OpnClient, uuid: str):
     return client.get(f"/api/firewall/alias/getItem/{uuid}").get("alias", {})
+
+def build_floating_rules(cfg):
+    """
+    Build floating firewall rules from root floating_rules section.
+    Returns list of rule definitions.
+    """
+    floating_rules_def = cfg.get("floating_rules", [])
+    vlan_assignments = cfg.get("__vlan_assignments__", {})
+    vlans = cfg.get("vlans", {})
+    
+    # Build VLAN ID to name mapping
+    vlan_id_to_name = {}
+    for vlan_name, vlan_def in vlans.items():
+        vlan_id = vlan_def.get("id")
+        if vlan_id:
+            vlan_id_to_name[vlan_id] = vlan_name
+    
+    rules = []
+    
+    for rule_def in floating_rules_def:
+        # Resolve VLANs to interface names
+        vlan_refs = rule_def.get("vlans", [])
+        interfaces = []
+        
+        for vlan_ref in vlan_refs:
+            # Support both VLAN IDs (integers) and names (strings)
+            if isinstance(vlan_ref, int):
+                vlan_name = vlan_id_to_name.get(vlan_ref)
+            else:
+                vlan_name = vlan_ref
+            
+            if not vlan_name:
+                continue
+                
+            # Get interface from assignments
+            assignment = vlan_assignments.get(vlan_name, {})
+            iface = assignment.get("interface")
+            if iface:
+                interfaces.append(iface)
+        
+        if not interfaces:
+            continue
+        
+        # Parse source
+        source = rule_def.get("source", "any")
+        source_value = _parse_address(source)
+        
+        # Parse destination
+        destination = rule_def.get("destination", "any")
+        dest_value = _parse_address(destination)
+        
+        # Parse destination port
+        dest_port = rule_def.get("destination_port", "")
+        if dest_port:
+            dest_port = _resolve_alias_reference(dest_port)
+        
+        # Normalize protocol to uppercase (OPNsense expects uppercase)
+        protocol = rule_def.get("protocol", "any")
+        if protocol.lower() != "any":
+            protocol = protocol.upper()
+        
+        # Build rule
+        rule = {
+            "action": "pass",
+            "interface": ",".join(interfaces),  # Multiple interfaces
+            "direction": "in",
+            "ipprotocol": "inet",
+            "protocol": protocol,
+            "source_net": source_value,
+            "destination_net": dest_value,
+            "quick": "1",
+            "statetype": "keep",
+            "enabled": "1",
+            "description": rule_def.get("description", ""),
+        }
+        
+        if dest_port:
+            rule["destination_port"] = dest_port
+        
+        rules.append(rule)
+    
+    return rules
+
+
+def _parse_address(addr):
+    """
+    Parse address field and return the value for OPNsense API.
+    Examples:
+      - "any" → "any"
+      - "this_firewall" → "(self)"
+      - "printers.hosts" → "printers_hosts"
+      - "!local_private_networks.networks" → "!local_private_networks"
+    """
+    if addr == "any":
+        return "any"
+    
+    if addr == "this_firewall":
+        return "(self)"
+    
+    # Handle negation
+    negated = False
+    if addr.startswith("!"):
+        negated = True
+        addr = addr[1:]
+    
+    # Handle service alias reference (e.g., "printers.hosts")
+    alias_name = _resolve_alias_reference(addr)
+    
+    if negated:
+        alias_name = f"!{alias_name}"
+    
+    return alias_name
+
+
+def _resolve_alias_reference(ref):
+    """
+    Resolve service reference like "printers.hosts" to alias name "printers_hosts".
+    """
+    if ".hosts" in ref:
+        return ref.replace(".hosts", "_hosts")
+    elif ".ports" in ref:
+        return ref.replace(".ports", "_ports")
+    elif ".networks" in ref:
+        return ref.replace(".networks", "")
+    return ref
 
 
 def _set_alias(client: OpnClient, uuid: str, payload: dict):
@@ -226,9 +265,9 @@ def apply_firewall(cfg, client: OpnClient):
     """
     changed = False
 
-    # Build desired state
+    # Build desired state 
     desired_aliases = build_aliases(cfg)
-    desired_rules = build_firewall_rules(cfg)
+    desired_rules = build_floating_rules(cfg)
 
     # Create savepoint before making changes
     savepoint_response = client.post("/api/firewall/filter/savepoint")
@@ -256,57 +295,34 @@ def apply_firewall(cfg, client: OpnClient):
                 changed = True
 
         # Sync rules
-        # Build index of existing rules by their real matching fields
         existing_rules = _search_rules(client)
 
         def make_key(rule):
+            """Create unique key from rule fields for matching."""
             return (
                 rule.get("interface", ""),
-                rule.get("type", ""),
-                rule.get("source", ""),
-                rule.get("source_port", ""),
-                rule.get("destination", ""),
-                rule.get("destination_port", ""),
-                rule.get("protocol", ""),
+                rule.get("action", ""),
                 rule.get("direction", ""),
+                rule.get("ipprotocol", ""),
+                rule.get("protocol", ""),
+                rule.get("source_net", ""),
+                rule.get("source_port", ""),
+                rule.get("destination_net", ""),
+                rule.get("destination_port", ""),
+                rule.get("description", ""),
             )
 
         existing_index = {make_key(r): r for r in existing_rules}
 
         for rule_data in desired_rules:
-            desired_key = (
-                rule_data["interface"],
-                rule_data.get("action", "pass"),
-                rule_data.get("src", "any"),
-                rule_data.get("src_port", ""),
-                rule_data.get("dst", "any"),
-                rule_data.get("dst_port", ""),
-                "any",      # protocol
-                "in",       # direction
-            )
+            desired_key = make_key(rule_data)
 
             if desired_key in existing_index:
                 # Rule already exists exactly
                 continue
 
             # Otherwise create it
-            opn_rule = {
-                "type": rule_data.get("action", "pass"),
-                "interface": rule_data["interface"],
-                "direction": "in",
-                "ipprotocol": "inet",
-                "protocol": "any",
-                "quick": "yes",
-                "statetype": "keep state",
-                "source_net": rule_data.get("src", "any"),
-                "destination_net": rule_data.get("dst", "any"),
-                "description": rule_data.get("descr", ""),
-            }
-
-            if "dst_port" in rule_data:
-                opn_rule["destination_port"] = str(rule_data["dst_port"])
-
-            _add_rule(client, opn_rule)
+            _add_rule(client, rule_data)
             changed = True
 
 
