@@ -1,5 +1,8 @@
-from core.client import OpnClient
+"""Unbound DNS configuration management for OPNsense."""
+
 import ipaddress
+
+from core.client import OpnClient
 
 
 def cidr_to_reverse_zone(cidr: str) -> str | None:
@@ -22,13 +25,12 @@ def cidr_to_reverse_zone(cidr: str) -> str | None:
     # /8 -> first octet, /16 -> first two octets, /24 -> first three octets
     if prefix_len >= 24:
         return f"{octets[2]}.{octets[1]}.{octets[0]}.in-addr.arpa"
-    elif prefix_len >= 16:
+    if prefix_len >= 16:
         return f"{octets[1]}.{octets[0]}.in-addr.arpa"
-    elif prefix_len >= 8:
+    if prefix_len >= 8:
         return f"{octets[0]}.in-addr.arpa"
-    else:
-        # For larger networks, just use the first octet
-        return f"{octets[0]}.in-addr.arpa"
+    # For larger networks, just use the first octet
+    return f"{octets[0]}.in-addr.arpa"
 
 
 def build_dns_forwards(cfg):
@@ -45,7 +47,7 @@ def build_dns_forwards(cfg):
     """
     domain = cfg.get("__domain__")
     forwards = []
-    
+
     # Add custom forwards first (e.g., for AdGuard, external DNS)
     custom_forwards = cfg.get("dns_forwards", [])
     if custom_forwards:
@@ -56,9 +58,9 @@ def build_dns_forwards(cfg):
                 "port": str(fwd.get("port", "53")),
                 "description": fwd.get("description", ""),
             })
-    
+
     # Add VLAN-based forwards
-    if domain:        
+    if domain:
         # Forward lookup: domain -> 127.0.0.1:53053
         forwards.append(
             {
@@ -68,7 +70,7 @@ def build_dns_forwards(cfg):
                 "description": f"Forward zone for {domain} domain",
             }
         )
-        
+
         for vlan_name, vlan in cfg["vlans"].items():
             cidr = vlan.get("cidr")
             if not cidr:
@@ -123,12 +125,12 @@ def build_host_overrides(cfg):
     """
     overrides = []
     custom_overrides = cfg.get("host_overrides", [])
-    
+
     for override in custom_overrides:
         fqdn = override.get("hostname", "")
         if not fqdn:
             continue
-            
+
         # Split FQDN into hostname and domain
         # Handle wildcards: "*.domain.com" -> hostname="*", domain="domain.com"
         if fqdn.startswith("*."):
@@ -148,14 +150,14 @@ def build_host_overrides(cfg):
                 # No domain part, use as hostname only
                 hostname = parts[0]
                 domain = ""
-        
+
         overrides.append({
             "hostname": hostname,
             "domain": domain,
             "ip": override.get("ip", ""),
             "description": override.get("description", ""),
-        })
-    
+            })
+
     return overrides
 
 
@@ -300,6 +302,6 @@ def apply_unbound(cfg, client: OpnClient):
     """
     forwards_changed = apply_unbound_forwards(cfg, client)
     overrides_changed = apply_unbound_host_overrides(cfg, client)
-    
+
     if forwards_changed or overrides_changed:
         client.post("/api/unbound/service/reconfigure")

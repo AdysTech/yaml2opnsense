@@ -1,4 +1,11 @@
+"""DHCP/DNSMasq configuration builder and applier for OPNsense."""
+import ipaddress
+
+from core.client import OpnClient
+
+
 def expand_dhcp_options(vlan):
+    """Expand DHCP options for a VLAN, replacing 'gateway' with the actual gateway IP."""
     opts = vlan.get("dhcp_options", {})
     gw = vlan["gateway"]
     result = []
@@ -10,7 +17,10 @@ def expand_dhcp_options(vlan):
             result.append(f"{code},{value}")
 
     return result
+
+
 def build_dhcp_scopes(cfg):
+    """Build DHCP scope definitions from VLAN configuration."""
     scopes = []
     for name, v in cfg["vlans"].items():
         dhcp_cfg = v.get("dhcp")
@@ -25,10 +35,10 @@ def build_dhcp_scopes(cfg):
         scopes.append(scope)
 
     return scopes
-from core.client import OpnClient
-import ipaddress
+
 
 def build_static_hosts(cfg):
+    """Build static host entries from VLAN static leases."""
     domain = cfg["__domain__"]
     vlans = cfg["vlans"]
     hosts = []
@@ -38,16 +48,18 @@ def build_static_hosts(cfg):
         for _, entry in leases.items():
             hosts.append({
                 "host": entry["hostname"],
-                "domain":entry.get("domain", domain),
+                "domain": entry.get("domain", domain),
                 "ip": v.get("gateway") if entry.get("ip") == "gateway" else entry.get("ip"),
-                "hwaddr": entry.get("mac","").upper(),
-                "descr": entry.get("description",""),
+                "hwaddr": entry.get("mac", "").upper(),
+                "descr": entry.get("description", ""),
                 "tags": entry.get("tags", []),
             })
 
     return hosts
 
+
 def build_vlan_networks(cfg):
+    """Build a dictionary of VLAN name to IP network objects from CIDR definitions."""
     nets = {}
     for name, v in cfg["vlans"].items():
         cidr = v.get("cidr")
@@ -58,12 +70,13 @@ def build_vlan_networks(cfg):
                 continue
     return nets
 
+
 def build_vlan_options(cfg):
     """
     Build DHCP options for VLANs.
     Skips options 3 (router) and 6 (dns-server) when they equal gateway,
     as these are automatically sent by dnsmasq when a DHCP range is created.
-    
+
     Supports both simple and detailed DHCP option formats:
     - Simple: code: value
     - Detailed: code: {value: val, description: desc}
@@ -75,7 +88,7 @@ def build_vlan_options(cfg):
         items = []
         for code, entry in opts.items():
             code_int = int(code)
-            
+
             # Handle both simple string and dict format
             if isinstance(entry, dict):
                 value = entry.get("value", "")
@@ -83,15 +96,15 @@ def build_vlan_options(cfg):
             else:
                 value = entry
                 description = ""
-            
+
             # Skip options 3 (router) and 6 (dns-server) when value is "gateway"
             # These are automatically configured by dnsmasq for DHCP ranges
             if code_int in (3, 6) and value == "gateway":
                 continue
             val = gw if value == "gateway" else value
             items.append({
-                "option": str(code), 
-                "value": str(val), 
+                "option": str(code),
+                "value": str(val),
                 "type": "set",
                 "description": str(description)
             })
@@ -99,7 +112,9 @@ def build_vlan_options(cfg):
             result[name] = items
     return result
 
+
 def derive_range_from_cidr(cidr: str, gateway: str | None = None):
+    """Derive a DHCP range (start, end) from a CIDR, optionally excluding the gateway."""
     try:
         net = ipaddress.ip_network(cidr, strict=False)
     except Exception:
@@ -124,6 +139,7 @@ def derive_range_from_cidr(cidr: str, gateway: str | None = None):
         return None
     return (str(ipaddress.ip_address(first)), str(ipaddress.ip_address(last)))
 
+
 def _search_hosts(client: OpnClient):
     try:
         data = client.get("/api/dnsmasq/settings/search_host")
@@ -131,14 +147,18 @@ def _search_hosts(client: OpnClient):
     except Exception:
         return []
 
+
 def _get_host(client: OpnClient, uuid: str):
     return client.get(f"/api/dnsmasq/settings/get_host/{uuid}").get("host", {})
+
 
 def _set_host(client: OpnClient, uuid: str, host_payload: dict):
     return client.post(f"/api/dnsmasq/settings/set_host/{uuid}", {"host": host_payload})
 
+
 def _add_host(client: OpnClient, host_payload: dict):
     return client.post("/api/dnsmasq/settings/add_host", {"host": host_payload})
+
 
 def _search_ranges(client: OpnClient):
     try:
@@ -147,14 +167,18 @@ def _search_ranges(client: OpnClient):
     except Exception:
         return []
 
+
 def _get_range(client: OpnClient, uuid: str):
     return client.get(f"/api/dnsmasq/settings/get_range/{uuid}").get("range", {})
+
 
 def _set_range(client: OpnClient, uuid: str, payload: dict):
     return client.post(f"/api/dnsmasq/settings/set_range/{uuid}", {"range": payload})
 
+
 def _add_range(client: OpnClient, payload: dict):
     return client.post("/api/dnsmasq/settings/add_range", {"range": payload})
+
 
 def _search_options(client: OpnClient):
     try:
@@ -163,14 +187,18 @@ def _search_options(client: OpnClient):
     except Exception:
         return []
 
+
 def _get_option(client: OpnClient, uuid: str):
     return client.get(f"/api/dnsmasq/settings/get_option/{uuid}").get("option", {})
+
 
 def _set_option(client: OpnClient, uuid: str, payload: dict):
     return client.post(f"/api/dnsmasq/settings/set_option/{uuid}", {"option": payload})
 
+
 def _add_option(client: OpnClient, payload: dict):
     return client.post("/api/dnsmasq/settings/add_option", {"option": payload})
+
 
 def _get_tag_list(client: OpnClient):
     try:
@@ -180,9 +208,11 @@ def _get_tag_list(client: OpnClient):
     except Exception:
         return {}
 
+
 def _add_tag(client: OpnClient, tag_name: str):
     payload = {"tag": {"name": tag_name}}
     return client.post("/api/dnsmasq/settings/add_tag", payload)
+
 
 def ensure_tags_exist(cfg, client: OpnClient) -> dict:
     """
@@ -191,38 +221,40 @@ def ensure_tags_exist(cfg, client: OpnClient) -> dict:
     """
     existing_tags = _get_tag_list(client)
     tag_map = existing_tags.copy()
-    
+
     # Collect all unique tags from static_leases
     required_tags = set()
     for vlan in cfg["vlans"].values():
         for lease in vlan.get("static_leases", {}).values():
             tags = lease.get("tags", [])
             required_tags.update(tags)
-        
+
         # Also collect tags from dhcp_tagged_options
         for tagged_opt in vlan.get("dhcp_tagged_options", []):
             tag = tagged_opt.get("tag")
             if tag:
                 required_tags.add(tag)
-    
+
     # Create missing tags
     for tag in required_tags:
         if tag not in tag_map:
-            result = _add_tag(client, tag)
+            _add_tag(client, tag)
             # Refresh tag list to get the new UUID
             tag_map = _get_tag_list(client)
-    
+
     return tag_map
 
+
 def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
+    """Synchronize static DNS/DHCP hosts with OPNsense. Returns True if changes were made."""
     changed = False
     desired_hosts = build_static_hosts(cfg)
     existing_hosts = _search_hosts(client)
-    
+
     # Index by MAC address for reliable matching
     host_index = {}
-    for host in existing_hosts:      
-        key = host.get("hwaddr","").upper() if host.get("hwaddr","") else host.get("ip", "")
+    for host in existing_hosts:
+        key = host.get("hwaddr", "").upper() if host.get("hwaddr", "") else host.get("ip", "")
         if key:
             host_index[key] = host
 
@@ -231,7 +263,7 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
         tags = desired.get("tags", [])
         tag_uuids = [tag_map.get(tag, "") for tag in tags if tag in tag_map]
         desired_set_tag = ",".join(filter(None, tag_uuids))
-        
+
         return (
             current.get("ip", "") == str(desired.get("ip", "")) and
             str(current.get("hwaddr", "")).upper() == str(desired.get("hwaddr", "")).upper() and
@@ -246,7 +278,7 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
         tags = desired.get("tags", [])
         tag_uuids = [tag_map.get(tag, "") for tag in tags if tag in tag_map]
         set_tag_value = ",".join(filter(None, tag_uuids))
-        
+
         return {
             "host": desired.get("host", ""),
             "domain": desired.get("domain", ""),
@@ -264,7 +296,7 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
         }
 
     for host in desired_hosts:
-        key = host.get("hwaddr","").upper() if host.get("hwaddr","") else host.get("ip", "")
+        key = host.get("hwaddr", "").upper() if host.get("hwaddr", "") else host.get("ip", "")
         # Match by MAC address only
         if key in host_index:
             current = host_index[key]
@@ -279,6 +311,7 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
 
 
 def apply_dnsmasq_ranges(cfg, client: OpnClient) -> bool:
+    """Synchronize DHCP address ranges with OPNsense. Returns True if changes were made."""
     changed = False
 
     existing_ranges = _search_ranges(client)
@@ -299,7 +332,7 @@ def apply_dnsmasq_ranges(cfg, client: OpnClient) -> bool:
         try:
             net = ipaddress.ip_network(cidr, strict=False)
         except Exception:
-            net = None        
+            net = None
         explicit_range = None
         if isinstance(dhcp_cfg, dict):
             rng = dhcp_cfg.get("range")
@@ -345,6 +378,7 @@ def apply_dnsmasq_ranges(cfg, client: OpnClient) -> bool:
 
 
 def apply_dnsmasq_options(cfg, client: OpnClient) -> bool:
+    """Synchronize per-VLAN DHCP options with OPNsense. Returns True if changes were made."""
     changed = False
     vlan_options = build_vlan_options(cfg)
     existing_options = _search_options(client)
@@ -361,7 +395,8 @@ def apply_dnsmasq_options(cfg, client: OpnClient) -> bool:
         if isinstance(current_type, dict):
             if isinstance(current_type.get('set'), dict) and current_type['set'].get('selected'):
                 return 'set'
-            if isinstance(current_type.get('match'), dict) and current_type['match'].get('selected'):
+            set_selected = current_type.get('match')
+            if isinstance(set_selected, dict) and set_selected.get('selected'):
                 return 'match'
             return 'basic'
         if not current_type:
@@ -377,9 +412,9 @@ def apply_dnsmasq_options(cfg, client: OpnClient) -> bool:
             desired_type = item.get("type", "set")
             desired_description = item.get("description", "")
             payload = {
-                "interface": iface, 
-                "option": item["option"], 
-                "value": item["value"], 
+                "interface": iface,
+                "option": item["option"],
+                "value": item["value"],
                 "type": desired_type,
                 "descr": desired_description
             }
@@ -402,13 +437,10 @@ def apply_dnsmasq_options(cfg, client: OpnClient) -> bool:
 
 
 def apply_dnsmasq_tagged_options(cfg, client: OpnClient, tag_map: dict) -> bool:
-    """
-    Apply DHCP options that are tagged for specific clients.
-    Handles the expanded format with option, value, description, and force.
-    """
+    """Apply DHCP options that are tagged for specific clients."""
     changed = False
     existing_options = _search_options(client)
-    
+
     # Index existing options by (interface, option_code, tag)
     opt_index = {}
     for row in existing_options:
@@ -422,16 +454,16 @@ def apply_dnsmasq_tagged_options(cfg, client: OpnClient, tag_map: dict) -> bool:
         iface = cfg.get("__vlan_assignments__", {}).get(vlan_name, {}).get("interface")
         if not iface:
             continue
-        
+
         tagged_options = vlan.get("dhcp_tagged_options", [])
         for tagged_opt in tagged_options:
             tag_label = tagged_opt.get("tag")
             if not tag_label or tag_label not in tag_map:
                 continue
-            
+
             tag_uuid = tag_map[tag_label]
             options = tagged_opt.get("options", [])
-            
+
             for opt in options:
                 # Handle both old dict format and new list format
                 if isinstance(opt, dict):
@@ -442,10 +474,10 @@ def apply_dnsmasq_tagged_options(cfg, client: OpnClient, tag_map: dict) -> bool:
                 else:
                     # Skip invalid entries
                     continue
-                
+
                 if not code:
                     continue
-                
+
                 payload = {
                     "interface": iface,
                     "type": "set",
@@ -457,7 +489,7 @@ def apply_dnsmasq_tagged_options(cfg, client: OpnClient, tag_map: dict) -> bool:
                     "force": force,
                     "descr": description
                 }
-                
+
                 key = (iface, code, tag_uuid)
                 if key in opt_index:
                     current_row = opt_index[key]
@@ -476,12 +508,14 @@ def apply_dnsmasq_tagged_options(cfg, client: OpnClient, tag_map: dict) -> bool:
 
     return changed
 
+
 def apply_dnsmasq(cfg, client: OpnClient):
+    """Apply all DHCP/DNSMasq configuration: tags, hosts, ranges, and options."""
     changed = False
-    
+
     # First, ensure all tags exist and get the tag map
     tag_map = ensure_tags_exist(cfg, client)
-    
+
     if apply_dnsmasq_hosts(cfg, client, tag_map):
         changed = True
     if apply_dnsmasq_ranges(cfg, client):
@@ -490,6 +524,6 @@ def apply_dnsmasq(cfg, client: OpnClient):
         changed = True
     if apply_dnsmasq_tagged_options(cfg, client, tag_map):
         changed = True
-        
+
     if changed:
         client.post("/api/dnsmasq/service/reconfigure")

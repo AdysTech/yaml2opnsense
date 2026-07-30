@@ -1,3 +1,4 @@
+"""FreeRADIUS user management for OPNsense via MVC API."""
 from core.client import OpnClient
 
 
@@ -88,7 +89,7 @@ def apply_freeradius(cfg, client: OpnClient):
     if not desired_users:
         return
 
-    changed = False
+    _changed = False
     existing_users = _get_all_users(client)
     by_username = {str(u.get("username", "")): u for u in existing_users if u.get("username")}
 
@@ -106,17 +107,7 @@ def apply_freeradius(cfg, client: OpnClient):
             current = by_username[uname]
             if not equal_enough(current, user):
                 _set_user(client, current["uuid"], user)
-                changed = True
+                _changed = True
         else:
             _add_user(client, user)
-            changed = True
-
-    # Delete users not in desired config
-    desired_usernames = {u["username"] for u in desired_users}
-    for uname, existing in by_username.items():
-        if uname not in desired_usernames:
-            client.post(f"/api/freeradius/user/delUser/{existing['uuid']}")
-            changed = True
-
-    if changed:
-        client.post("/api/freeradius/service/reconfigure")
+            _changed = True

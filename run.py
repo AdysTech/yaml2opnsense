@@ -1,12 +1,13 @@
+"""CLI entry point for yaml2opnsense configuration application."""
 import sys
 from cli import apply
 
 def main():
+    """Parse arguments and apply the yaml2opnsense configuration."""
     # Parse arguments
     args = sys.argv[1:]
     path = "nammane.arpa.yaml"
     test_iface = None
-    
     i = 0
     while i < len(args):
         if args[i] == "--test":
@@ -15,11 +16,10 @@ def main():
                 i += 1
             else:
                 print("\n --test requires interface name (e.g., --test eth0)")
-                sys.exit(1)        
+                sys.exit(1)
         elif not args[i].startswith("--"):
             path = args[i]
         i += 1
-    
     # Apply configuration (with optional testing)
     apply(path, test_interface=test_iface)
 
