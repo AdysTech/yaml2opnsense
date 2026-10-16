@@ -46,6 +46,13 @@ def build_static_hosts(cfg):
     for v in vlans.values():
         leases = v.get("static_leases", {})
         for _, entry in leases.items():
+            # Build FQDN aliases by appending the domain to each alias entry
+            # dnsmasq requires FQDNs in the aliases field
+            aliases = entry.get("aliases", [])
+            entry_domain = entry.get("domain", domain)
+            fqdn_aliases = [a if "." in a else f"{a}.{entry_domain}" for a in aliases]
+            aliases_str = ",".join(fqdn_aliases) if fqdn_aliases else ""
+
             hosts.append({
                 "host": entry["hostname"],
                 "domain": entry.get("domain", domain),
@@ -53,6 +60,7 @@ def build_static_hosts(cfg):
                 "hwaddr": entry.get("mac", "").upper(),
                 "descr": entry.get("description", ""),
                 "tags": entry.get("tags", []),
+                "aliases": aliases_str,
             })
 
     return hosts
@@ -264,13 +272,20 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
         tag_uuids = [tag_map.get(tag, "") for tag in tags if tag in tag_map]
         desired_set_tag = ",".join(filter(None, tag_uuids))
 
+        # Normalize aliases: OPNsense may return them as list or comma-separated string
+        current_aliases = current.get("aliases", "")
+        if isinstance(current_aliases, list):
+            current_aliases = ",".join(current_aliases)
+        desired_aliases = desired.get("aliases", "")
+
         return (
             current.get("ip", "") == str(desired.get("ip", "")) and
             str(current.get("hwaddr", "")).upper() == str(desired.get("hwaddr", "")).upper() and
             str(current.get("host", "")) == str(desired.get("host", "")) and
             str(current.get("domain", "")) == str(desired.get("domain", "")) and
             str(current.get("descr", "")) == str(desired.get("descr", "")) and
-            str(current.get("set_tag", "")) == desired_set_tag
+            str(current.get("set_tag", "")) == desired_set_tag and
+            str(current_aliases) == str(desired_aliases)
         )
 
     def _format_host_for_set(desired: dict) -> dict:
@@ -284,7 +299,7 @@ def apply_dnsmasq_hosts(cfg, client: OpnClient, tag_map: dict) -> bool:
             "domain": desired.get("domain", ""),
             "local": "0",
             "ip": desired.get("ip", ""),
-            "aliases": "",
+            "aliases": desired.get("aliases", ""),
             "cnames": "",
             "client_id": "*",
             "hwaddr": desired.get("hwaddr", ""),

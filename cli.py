@@ -31,7 +31,7 @@ def apply(path, test_interface=None):
 
     apply_dnsmasq(cfg, client)  # static leases, DHCP config as needed
     apply_unbound(cfg, client)  # DNS forwards and host overrides
-    apply_freeradius(cfg, client)  # FreeRADIUS users (MAC/username, VLAN)
+    apply_freeradius(cfg, client)  # FreeRADIUS users (MAC/username, VLAN) + clients (APs)
     apply_haproxy(cfg, client)      # HAProxy load balancer configuration
     # apply_freeradius then apply_haproxy, then apply_firewall (rules based on policies)
     # Run validation tests if requested

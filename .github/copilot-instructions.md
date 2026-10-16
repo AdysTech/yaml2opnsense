@@ -128,6 +128,8 @@ your.domain.name:            # Root key = network domain name
           hostname: my-server
           ip: 192.168.10.5
           mac: "AA:BB:CC:DD:EE:FF"
+          aliases:                # Optional: bare hostnames (domain is appended automatically)
+            - myserver            # Both 'my-server' and 'myserver.<domain>' resolve to 192.168.10.5
 
   free_radius_users:
     - <vlan_name>:

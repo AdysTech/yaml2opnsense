@@ -69,6 +69,8 @@ your.domain.name:
           hostname: my-server
           ip: 192.168.10.5
           mac: 00:11:22:33:44:55
+          aliases:                       # Optional: bare hostnames (domain is appended automatically)
+            - myserver                  # 'my-server' and 'myserver.<domain>' both resolve to 192.168.10.5
 
     # Example of a server VLAN with a DHCP server range.
     servers:
@@ -99,6 +101,18 @@ your.domain.name:
           description: "my-laptop"
         - mac: 11:22:33:44:55:66
           description: "my-phone"
+
+  # --- FreeRADIUS Clients (RADIUS servers: wireless APs, etc.) ---
+  # One entry per RADIUS client that authenticates against FreeRADIUS.
+  # The mapping key is the client name and is the stable match key.
+  # 'ip' and 'secret' are required; 'enabled'/'require_ma' default to true.
+  # Clients present in OPNsense but not listed here are left untouched.
+  free_radius_clients:
+    my-uwifi-ap:
+      ip: 192.168.20.4
+      secret: "shared-radius-secret"
+      # enabled: true
+      # require_ma: true
 
   # --- Service Aliases ---
   # Defines aliases for services (IP + ports) to be used in firewall rules.

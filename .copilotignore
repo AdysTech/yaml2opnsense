@@ -1,0 +1,7 @@
+# Never send credentials or secrets to Copilot / Anthropic
+.env
+**/.env
+*.env
+
+# Private config repo — contains live network config and credentials
+yaml2opnsense-config/.env
