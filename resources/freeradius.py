@@ -40,8 +40,8 @@ def build_radius_users(cfg):
 
             user = {
                 "enabled": "1" if entry.get("enabled", True) else "0",
-                "username": str(mac),
-                "password": str(entry.get("password", mac)),
+                "username": str(mac).upper(),
+                "password": str(entry.get("password", mac)).upper(),
                 "passwordencryption": "Cleartext-Password",
                 "description": str(entry.get("description", "")),
             }
