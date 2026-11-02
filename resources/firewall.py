@@ -1,108 +1,367 @@
+"""Firewall alias and rule configuration management for OPNsense.
+
+Aliases (chunk 03, plans/03-aliases.md): YAML-defined `firewall.aliases`,
+synced add/update + mark only — never deletes. Ownership is marked in the
+description field with a " <provisioned>" suffix; content is compared
+order-insensitively so steady state is a no-op.
+
+Rules (chunk 04, not yet wired into the CLI): `build_floating_rules` and the
+filter-rule API helpers below. The old savepoint-based `apply_firewall` was
+superseded by the direct-mutate + reconfigure commit model (plans/README.md).
+"""
+
+import ipaddress
+import re
+
 from core.client import OpnClient
 
 
-def build_aliases(cfg):
+# ---------------------------------------------------------------------------
+# Aliases (chunk 03)
+# ---------------------------------------------------------------------------
+
+# Ownership marker appended to the description of every alias we create/update.
+PROVISIONED = " <provisioned>"
+
+# YAML content key -> OPNsense alias type.
+_TYPE_BY_KEY = {"hosts": "host", "ports": "port", "macs": "mac", "networks": "network"}
+
+_MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+_FQDN_RE = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$"
+)
+_PORT_RANGE_RE = re.compile(r"^(\d{1,5})-(\d{1,5})$")
+_SERVICE_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+
+def _lease_index(cfg):
+    """Build a hostname -> {"ip", "mac"} map from every VLAN's static_leases.
+
+    A lease whose ip is the literal "gateway" resolves to its VLAN's gateway.
     """
-    Build firewall aliases from service definitions.
-    Returns dict of alias_name -> alias_data.
-    
-    Supports both hostnames (resolved from static_leases) and IP addresses.
-    """
-    aliases = {}
-    services = cfg.get("services", {})
-    vlans = cfg.get("vlans", {})
-    unmanaged = cfg.get("unmanaged_local_networks", [])
-    
-    # Build hostname-to-IP map from static_leases
-    hostname_ip_map = {}
-    for vlan_name, vlan in vlans.items():
-        for lease_name, lease in vlan.get("static_leases", {}).items():
+    leases = {}
+    for vlan in (cfg.get("vlans") or {}).values():
+        gateway = vlan.get("gateway")
+        for lease in (vlan.get("static_leases") or {}).values():
             hostname = lease.get("hostname")
-            ip = vlan.get("gateway") if lease.get("ip") == "gateway" else lease.get("ip")
-            if hostname and ip:
-                hostname_ip_map[hostname] = ip
+            if not hostname:
+                continue
+            ip = lease.get("ip")
+            if ip == "gateway":
+                ip = gateway
+            entry = leases.setdefault(str(hostname), {})
+            if ip:
+                entry["ip"] = ip
+            if lease.get("mac"):
+                entry["mac"] = lease["mac"]
+    return leases
 
-    for service_name, service_def in services.items():
-        # Skip special sections
-        if service_name in ["floating_rules"]:
-            continue
 
-        # Host aliases - resolve hostnames to IPs
-        if "hosts" in service_def:
-            hosts = service_def["hosts"]
-            resolved_hosts = []
-            
-            for host in (hosts if isinstance(hosts, list) else [hosts]):
-                # Try to resolve hostname to IP
-                resolved_ip = hostname_ip_map.get(str(host))
-                if resolved_ip:
-                    resolved_hosts.append(resolved_ip)
-                else:
-                    # Not a known hostname, keep as-is (could be IP or external hostname)
-                    resolved_hosts.append(str(host))
-            
-            content = "\n".join(resolved_hosts)
-            
-            aliases[f"{service_name}_hosts"] = {
-                "name": f"{service_name}_hosts",
-                "type": "host",
-                "content": content,
-                "descr": f"Host alias for {service_name}",
-            }
+def _resolve_host(value, alias_name, leases):
+    """Resolve a host item to an IP literal or an FQDN, else ValueError."""
+    if value in leases:
+        ip = leases[value].get("ip")
+        if not ip:
+            raise ValueError(f"alias {alias_name}: lease {value!r} has no IP")
+        return str(ip)
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    if "." in value and _FQDN_RE.match(value):
+        return value.lower()  # FQDNs are case-insensitive; keep comparison stable
+    raise ValueError(
+        f"alias {alias_name}: {value!r} is not an IP, FQDN, or static-lease hostname"
+    )
 
-        # Port aliases
-        if "ports" in service_def:
-            ports = service_def["ports"]
-            content = "\n".join(str(p) for p in ports) if isinstance(ports, list) else str(ports)
-            
-            aliases[f"{service_name}_ports"] = {
-                "name": f"{service_name}_ports",
-                "type": "port",
-                "content": content,
-                "descr": f"Port alias for {service_name}",
-            }
 
-        # Special handling for local_private_networks
-        if service_name == "local_private_networks":
-            networks = []
-            
-            # Check if it has vlans list
-            if isinstance(service_def, list):
-                for item in service_def:
-                    if isinstance(item, dict) and "vlans" in item:
-                        # Add CIDRs from specified VLANs
-                        for vlan_name in item["vlans"]:
-                            vlan_def = vlans.get(vlan_name, {})
-                            cidr = vlan_def.get("cidr")
-                            if cidr:
-                                networks.append(cidr)
-                    elif item == "unmanaged_local_networks":
-                        # Add unmanaged networks
-                        networks.extend(unmanaged)
-            
-            if networks:
-                content = "\n".join(networks)
-                aliases["local_private_networks"] = {
-                    "name": "local_private_networks",
-                    "type": "network",
-                    "content": content,
-                    "descr": "All private local networks",
-                }
+def _resolve_mac(value, alias_name, leases):
+    """Resolve a MAC item (literal or lease hostname), lowercased."""
+    if value in leases:
+        mac = leases[value].get("mac")
+        if not mac:
+            raise ValueError(f"alias {alias_name}: lease {value!r} has no MAC")
+        return str(mac).lower()
+    if _MAC_RE.match(value):
+        return value.lower()
+    raise ValueError(
+        f"alias {alias_name}: {value!r} is not a MAC address or static-lease hostname"
+    )
+
+
+def _validate_port(value, alias_name):
+    """Accept an int 1-65535, an a-b range, or a service name."""
+    if value.isdigit():
+        port = int(value)
+        if not 1 <= port <= 65535:
+            raise ValueError(f"alias {alias_name}: port {value!r} out of range 1-65535")
+        return str(port)
+    m = _PORT_RANGE_RE.match(value)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if not 1 <= lo < hi <= 65535:
+            raise ValueError(f"alias {alias_name}: port range {value!r} is invalid")
+        return f"{lo}-{hi}"
+    if _SERVICE_RE.match(value):
+        return value
+    raise ValueError(
+        f"alias {alias_name}: {value!r} is not a port, an a-b range, or a service name"
+    )
+
+
+def _normalize_network(value, alias_name):
+    """CIDR -> canonical form; a bare IP is kept as-is (OPNsense reads it as /32)."""
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        raise ValueError(f"alias {alias_name}: {value!r} is not an IP or CIDR")
+
+
+def _port_sort_key(port):
+    """Deterministic order: plain ports by number, then ranges, then names."""
+    m = _PORT_RANGE_RE.match(port)
+    if m:
+        return (1, int(m.group(1)), int(m.group(2)))
+    if port.isdigit():
+        return (0, int(port), 0)
+    return (2, 0, port)
+
+
+def _validate_items(alias_name, alias_type, raw_items, leases):
+    """Validate, normalize, sort and de-dupe the items of one alias."""
+    items = []
+    for raw in raw_items:
+        value = str(raw).strip()
+        if not value:
+            raise ValueError(f"alias {alias_name}: empty item")
+        if alias_type == "host":
+            items.append(_resolve_host(value, alias_name, leases))
+        elif alias_type == "mac":
+            items.append(_resolve_mac(value, alias_name, leases))
+        elif alias_type == "port":
+            items.append(_validate_port(value, alias_name))
+        else:  # network
+            items.append(_normalize_network(value, alias_name))
+
+    if not items:
+        raise ValueError(f"alias {alias_name}: needs at least one item")
+
+    unique = set(items)
+    if alias_type == "port":
+        return sorted(unique, key=_port_sort_key)
+    return sorted(unique)
+
+
+def build_aliases(cfg, derived=None):
+    """
+    Build the desired alias set from `cfg["firewall"]["aliases"]`.
+
+    Pure — no client calls. Returns {name: {"name", "type", "items", "description"}}
+    where items are validated, normalized, sorted and de-duplicated, and the
+    description already carries the PROVISIONED ownership marker.
+
+    `derived` is an optional {alias_name: [ip, ...]} map injected by the caller
+    (chunk 02 builds the WG_*_clients aliases from the wireguard section).
+    """
+    leases = _lease_index(cfg)
+    aliases_cfg = ((cfg.get("firewall") or {}).get("aliases")) or {}
+    aliases = {}
+
+    for name, ips in (derived or {}).items():
+        if name in aliases_cfg:
+            raise ValueError(
+                f"alias {name}: defined both in firewall.aliases and the derived set"
+            )
+        items = []
+        for ip in ips:
+            try:
+                items.append(str(ipaddress.ip_address(str(ip))))
+            except ValueError:
+                raise ValueError(f"derived alias {name}: {ip!r} is not an IP")
+        aliases[name] = {
+            "name": name,
+            "type": "host",
+            "items": sorted(set(items)),
+            "description": f"{name}{PROVISIONED}",
+        }
+
+    for name, entry in aliases_cfg.items():
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"alias {name}: expected a mapping with one of {sorted(_TYPE_BY_KEY)}"
+            )
+        content_keys = [key for key in _TYPE_BY_KEY if key in entry]
+        if len(content_keys) != 1:
+            raise ValueError(
+                f"alias {name}: exactly one of {sorted(_TYPE_BY_KEY)} required, "
+                f"got {content_keys or 'none'}"
+            )
+        unknown = set(entry) - set(_TYPE_BY_KEY) - {"description"}
+        if unknown:
+            raise ValueError(f"alias {name}: unknown key(s) {sorted(unknown)}")
+
+        alias_type = _TYPE_BY_KEY[content_keys[0]]
+        raw_items = entry[content_keys[0]]
+        items = _validate_items(
+            name, alias_type,
+            raw_items if isinstance(raw_items, list) else [raw_items],
+            leases,
+        )
+        description = str(entry.get("description") or "").strip()
+        aliases[name] = {
+            "name": name,
+            "type": alias_type,
+            "items": items,
+            "description": f"{description or name}{PROVISIONED}",
+        }
 
     return aliases
 
 
-
 def _search_aliases(client: OpnClient):
+    """Fetch all existing alias rows."""
     try:
-        data = client.post("/api/firewall/alias/searchItem")
+        data = client.post("/api/firewall/alias/search_item", {})
         return data.get("rows", [])
     except Exception:
         return []
 
 
 def _get_alias(client: OpnClient, uuid: str):
-    return client.get(f"/api/firewall/alias/getItem/{uuid}").get("alias", {})
+    """Get a single alias row by UUID."""
+    return client.get(f"/api/firewall/alias/get_item/{uuid}").get("alias", {})
+
+
+def _resolve_alias(client: OpnClient, name: str):
+    """Resolve an alias name to its UUID."""
+    return client.get(f"/api/firewall/alias/get_alias_u_u_i_d/{name}")
+
+
+def _set_alias(client: OpnClient, uuid: str, alias: dict):
+    """Update an existing alias. `alias` is the bare row (no wrapper)."""
+    return client.post(f"/api/firewall/alias/set_item/{uuid}", {"alias": alias})
+
+
+def _add_alias(client: OpnClient, alias: dict):
+    """Add a new alias."""
+    return client.post("/api/firewall/alias/add_item", {"alias": alias})
+
+
+def _payload(spec):
+    """API row for a built alias — only the fields we own; no audit/meta echo-back."""
+    return {
+        "name": spec["name"],
+        "type": spec["type"],
+        "content": "\n".join(spec["items"]),
+        "description": spec["description"],
+    }
+
+
+def _is_unmanaged_row(row):
+    """System rows (external/internal, __-prefixed, automatic) are never managed."""
+    if row.get("type") in ("external", "internal"):
+        return True
+    if str(row.get("name", "")).startswith("__"):
+        return True
+    if str(row.get("is_automatic", "")) in ("1", "true", "True"):
+        return True
+    return False
+
+
+def _is_marked(row):
+    """True when the row carries the <provisioned> ownership marker."""
+    descr = row.get("description", row.get("descr", ""))
+    return str(descr or "").endswith(PROVISIONED)
+
+
+def _content_set(row):
+    """Normalize a live row's newline-joined content into a comparable set.
+
+    IPs -> dotted, CIDRs -> canonical, MACs/FQDNs -> lowercase, everything else
+    (ports, ranges, service names, __lan_network) -> lowercase as-is.
+    """
+    items = set()
+    for line in str(row.get("content", "")).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if _MAC_RE.match(line):
+            items.add(line.lower())
+            continue
+        try:
+            items.add(str(ipaddress.ip_address(line)))
+            continue
+        except ValueError:
+            pass
+        try:
+            items.add(str(ipaddress.ip_network(line, strict=False)))
+            continue
+        except ValueError:
+            pass
+        items.add(line.lower())
+    return items
+
+
+def apply_aliases(cfg, client: OpnClient, derived=None):
+    """
+    Idempotently apply `firewall.aliases` (plus any derived aliases) to OPNsense.
+
+    Add/update + mark only — never deletes, never retypes (ValueError), and
+    skips system rows. Content is compared as a set, so the same items in a
+    different order is a no-op. Commits with `reconfigure` only when at least
+    one alias was added or updated.
+    """
+    desired = build_aliases(cfg, derived)
+    if not desired:
+        return False
+
+    alias_index = {row.get("name"): row for row in _search_aliases(client)}
+    changed = False
+
+    for spec in desired.values():
+        name = spec["name"]
+        row = alias_index.get(name)
+
+        if row is None:
+            _add_alias(client, _payload(spec))
+            changed = True
+            continue
+
+        if _is_unmanaged_row(row):
+            print(f"warning: alias {name} is system-managed, skipped")
+            continue
+
+        if row.get("type") != spec["type"]:
+            raise ValueError(
+                f"alias {name}: live type {str(row.get('type'))!r} does not match "
+                f"desired {spec['type']!r} — refusing to retype; rename in YAML instead"
+            )
+
+        live = _content_set(row)
+        want = set(spec["items"])
+        if live == want and _is_marked(row):
+            continue
+
+        payload = _payload(spec)
+        if live == want:
+            # Adoption: content already matches — stamp the marker only,
+            # and keep the live content verbatim.
+            payload["content"] = str(row.get("content", ""))
+        _set_alias(client, row.get("uuid"), payload)
+        changed = True
+
+    if changed:
+        client.post("/api/firewall/alias/reconfigure")
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Rules (chunk 04 — not yet wired into the CLI)
+# ---------------------------------------------------------------------------
 
 def build_floating_rules(cfg):
     """
@@ -112,58 +371,58 @@ def build_floating_rules(cfg):
     floating_rules_def = cfg.get("floating_rules", [])
     vlan_assignments = cfg.get("__vlan_assignments__", {})
     vlans = cfg.get("vlans", {})
-    
+
     # Build VLAN ID to name mapping
     vlan_id_to_name = {}
     for vlan_name, vlan_def in vlans.items():
         vlan_id = vlan_def.get("id")
         if vlan_id:
             vlan_id_to_name[vlan_id] = vlan_name
-    
+
     rules = []
-    
+
     for rule_def in floating_rules_def:
         # Resolve VLANs to interface names
         vlan_refs = rule_def.get("vlans", [])
         interfaces = []
-        
+
         for vlan_ref in vlan_refs:
             # Support both VLAN IDs (integers) and names (strings)
             if isinstance(vlan_ref, int):
                 vlan_name = vlan_id_to_name.get(vlan_ref)
             else:
                 vlan_name = vlan_ref
-            
+
             if not vlan_name:
                 continue
-                
+
             # Get interface from assignments
             assignment = vlan_assignments.get(vlan_name, {})
             iface = assignment.get("interface")
             if iface:
                 interfaces.append(iface)
-        
+
         if not interfaces:
             continue
-        
+
         # Parse source
         source = rule_def.get("source", "any")
         source_value = _parse_address(source)
-        
+
         # Parse destination
         destination = rule_def.get("destination", "any")
         dest_value = _parse_address(destination)
-        
+
         # Parse destination port
         dest_port = rule_def.get("destination_port", "")
         if dest_port:
             dest_port = _resolve_alias_reference(dest_port)
-        
+
         # Normalize protocol to uppercase (OPNsense expects uppercase)
         protocol = rule_def.get("protocol", "any")
         if protocol.lower() != "any":
             protocol = protocol.upper()
-        
+
         # Build rule
         rule = {
             "action": "pass",
@@ -178,12 +437,12 @@ def build_floating_rules(cfg):
             "enabled": "1",
             "description": rule_def.get("description", ""),
         }
-        
+
         if dest_port:
             rule["destination_port"] = dest_port
-        
+
         rules.append(rule)
-    
+
     return rules
 
 
@@ -198,22 +457,22 @@ def _parse_address(addr):
     """
     if addr == "any":
         return "any"
-    
+
     if addr == "this_firewall":
         return "(self)"
-    
+
     # Handle negation
     negated = False
     if addr.startswith("!"):
         negated = True
         addr = addr[1:]
-    
+
     # Handle service alias reference (e.g., "printers.hosts")
     alias_name = _resolve_alias_reference(addr)
-    
+
     if negated:
         alias_name = f"!{alias_name}"
-    
+
     return alias_name
 
 
@@ -230,108 +489,25 @@ def _resolve_alias_reference(ref):
     return ref
 
 
-def _set_alias(client: OpnClient, uuid: str, payload: dict):
-    return client.post(f"/api/firewall/alias/setItem/{uuid}", {"alias": payload})
-
-
-def _add_alias(client: OpnClient, payload: dict):
-    return client.post("/api/firewall/alias/addItem", {"alias": payload})
-
-
 def _search_rules(client: OpnClient):
+    """Fetch all existing filter rule rows."""
     try:
-        data = client.post("/api/firewall/filter/searchRule")
+        data = client.post("/api/firewall/filter/search_rule", {})
         return data.get("rows", [])
     except Exception:
         return []
 
 
 def _get_rule(client: OpnClient, uuid: str):
-    return client.get(f"/api/firewall/filter/getRule/{uuid}").get("rule", {})
+    """Get a single filter rule by UUID."""
+    return client.get(f"/api/firewall/filter/get_rule/{uuid}").get("rule", {})
 
 
-def _set_rule(client: OpnClient, uuid: str, payload: dict):
-    return client.post(f"/api/firewall/filter/setRule/{uuid}", {"rule": payload})
+def _set_rule(client: OpnClient, uuid: str, rule: dict):
+    """Update an existing filter rule. `rule` is the bare row (no wrapper)."""
+    return client.post(f"/api/firewall/filter/set_rule/{uuid}", {"rule": rule})
 
 
-def _add_rule(client: OpnClient, payload: dict):
-    return client.post("/api/firewall/filter/addRule", {"rule": payload})
-
-
-def apply_firewall(cfg, client: OpnClient):
-    """
-    Apply firewall aliases + rules to OPNsense idempotently.
-    Uses savepoint mechanism for safe changes.
-    """
-    changed = False
-
-    # Build desired state 
-    desired_aliases = build_aliases(cfg)
-    desired_rules = build_floating_rules(cfg)
-
-    # Create savepoint before making changes
-    savepoint_response = client.post("/api/firewall/filter/savepoint")
-    savepoint = savepoint_response.get("revision")
-
-    try:
-        # Sync aliases
-        existing_aliases = _search_aliases(client)
-        alias_index = {row.get("name"): row for row in existing_aliases}
-
-        for alias_name, alias_data in desired_aliases.items():
-            if alias_name in alias_index:
-                # Alias exists; compare and update if needed
-                uuid = alias_index[alias_name].get("uuid")
-                current = alias_index[alias_name]
-                if (
-                    str(current.get("type", "")) != str(alias_data.get("type", "")) or
-                    str(current.get("content", "")) != str(alias_data.get("content", ""))
-                ):
-                    _set_alias(client, uuid, alias_data)
-                    changed = True
-            else:
-                # Add new alias
-                _add_alias(client, alias_data)
-                changed = True
-
-        # Sync rules
-        existing_rules = _search_rules(client)
-
-        def make_key(rule):
-            """Create unique key from rule fields for matching."""
-            return (
-                rule.get("interface", ""),
-                rule.get("action", ""),
-                rule.get("direction", ""),
-                rule.get("ipprotocol", ""),
-                rule.get("protocol", ""),
-                rule.get("source_net", ""),
-                rule.get("source_port", ""),
-                rule.get("destination_net", ""),
-                rule.get("destination_port", ""),
-                rule.get("description", ""),
-            )
-
-        existing_index = {make_key(r): r for r in existing_rules}
-
-        for rule_data in desired_rules:
-            desired_key = make_key(rule_data)
-
-            if desired_key in existing_index:
-                # Rule already exists exactly
-                continue
-
-            # Otherwise create it
-            _add_rule(client, rule_data)
-            changed = True
-
-
-        if changed:
-            # Apply changes with rollback protection
-            client.post(f"/api/firewall/filter/apply/{savepoint}")
-            # Cancel rollback since changes succeeded
-            client.post(f"/api/firewall/filter/cancelRollback/{savepoint}")
-
-    except Exception as e:
-        # On error, rollback will happen automatically after 60s
-        raise RuntimeError(f"Firewall apply failed, will auto-rollback to savepoint {savepoint}: {e}")
+def _add_rule(client: OpnClient, rule: dict):
+    """Add a new filter rule."""
+    return client.post("/api/firewall/filter/add_rule", {"rule": rule})

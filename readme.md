@@ -73,11 +73,17 @@ Below is a high-level overview of the main configuration blocks.
 
 ## 🚀 Usage
 
-### Basic Application
-Apply your YAML configuration to OPNsense. The script will connect to the OPNsense API and apply all necessary changes idempotently.
+### Plan & apply
+The engine works terraform-style: it shows the delta between the YAML and the live box before doing anything.
+
+- **`plan`** — read-only; prints what `apply` would do (+create / ~update `field: old → new` / −delete). Makes **zero write requests** to OPNsense.
+- **`apply`** (default) — prints the same plan, then executes it. If the box is already in sync it skips all work entirely.
 ```bash
-python run.py nammane.arpa.yaml
+python run.py plan nammane.arpa.yaml
+python run.py apply nammane.arpa.yaml
 ```
+Secret fields (e.g. FreeRADIUS client passwords) are never printed — they show as `<changed>`.
+The legacy form `python run.py nammane.arpa.yaml` still works.
 
 ### With Validation Testing
 After applying the configuration, you can run a suite of network-level tests to validate that each VLAN is functioning as expected.

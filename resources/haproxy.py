@@ -3,6 +3,26 @@
 from core.client import OpnClient
 
 
+def _resolve_server_target(server_name, address, backend_port, hostname_ip_map):
+    """Return (ip, port) for one backend `servers[]` entry.
+
+    `address` may be a bare IP, a bare hostname, or `host:port`. When no port is
+    present the backend service port is used. Bare hostnames are resolved via the
+    static-lease map. Shared by the server and backend builders so the shared
+    server name (`{server_name}-{port}`) is identical in each.
+    """
+    if address and ":" in address:
+        host_part, port = address.rsplit(":", 1)
+    else:
+        host_part = address or ""
+        port = backend_port
+    if not host_part or "." not in host_part:
+        ip = hostname_ip_map.get(server_name) or host_part
+    else:
+        ip = host_part
+    return ip, port
+
+
 def build_haproxy_config(cfg):
     """
     Build HAProxy configuration from YAML config.
@@ -30,7 +50,13 @@ def build_haproxy_config(cfg):
         "frontends": [],
     }
 
-    # Build servers from backends
+    # Build one shared server row per distinct (address, port). The same node can
+    # serve several backends on the same port (docker_http and docker_https both
+    # target the pool on :80), and OPNsense links a backend to a *server* object,
+    # so a shared node:port is a single row referenced by both backends rather than
+    # one row per backend. If two backends share a node:port the first-seen
+    # health-check settings win (a single server row can carry only one).
+    seen_server_keys = set()
     for backend_name, backend_def in haproxy_cfg.get("backends", {}).items():
         # Get port from backend service definition (common for all servers in this backend)
         backend_port = str(backend_def.get("service", {}).get("port", "80"))
@@ -39,36 +65,11 @@ def build_haproxy_config(cfg):
             if server is None:
                 continue
             server_name = server.get("name", "")
-            address = server.get("address", "")
-
-            # Resolve hostname to IP if address is just a hostname or hostname:port
-            if ":" in address:
-                # Address contains explicit port (e.g., "192.168.1.1:8080")
-                host_part, port = address.rsplit(":", 1)
-            else:
-                # No port in address, use backend service port
-                host_part = address
-                port = backend_port
-
-            # If host_part is a hostname (not an IP), resolve it
-            if host_part and "." not in host_part:
-                # It's likely a hostname, try to resolve from static_leases
-                resolved_ip = hostname_ip_map.get(server_name)
-                if resolved_ip:
-                    ip = resolved_ip
-                else:
-                    # Fall back to using address as-is (might be IP)
-                    ip = host_part
-            elif host_part=='':
-                resolved_ip = hostname_ip_map.get(server_name)
-                if resolved_ip:
-                    ip = resolved_ip
-                else:
-                    # Fall back to using address as-is (might be IP)
-                    ip = host_part
-            else:
-                ip = host_part
-
+            ip, port = _resolve_server_target(server_name, server.get("address", ""), backend_port, hostname_ip_map)
+            key = (ip, port)
+            if key in seen_server_keys:
+                continue  # already emitted: shared node:port
+            seen_server_keys.add(key)
 
             # Get check_interval from server or backend health_check
             check_interval = server.get("check_interval")
@@ -76,16 +77,15 @@ def build_haproxy_config(cfg):
                 health_check = backend_def.get("health_check", {})
                 check_interval = health_check.get("check_interval", "5s")
 
-
             config["servers"].append({
-                "name": f"{server_name}_{backend_name}",
+                "name": f"{server_name}-{port}",
                 "address": ip,
                 "port": port,
                 "checkport": server.get("check_port", port),
-                "check": "1" if server.get("check", True) else "0",
-                "checkinterval": check_interval,
+                "mode": "active" if server.get("check", True) else "passive",
+                "checkInterval": check_interval,
                 "enabled": "1",
-                "description": f"Server {server_name} for {backend_name}",
+                "description": f"Backend server {server_name} ({ip}:{port})",
             })
 
     # Build health checks from backends
@@ -105,6 +105,12 @@ def build_haproxy_config(cfg):
 
             if "port" in health_check:
                 hc_config["checkport"] = str(health_check["port"])
+
+            # The rendered haproxy.cfg `check inter <X>` comes from the monitor's
+            # `interval` field (verified via /api/haproxy/export/config), not from the
+            # server row. So check_interval must be written here, not (only) on the
+            # server's checkInterval.
+            hc_config["interval"] = health_check.get("check_interval", "5s")
 
             config["healthchecks"].append(hc_config)
 
@@ -143,17 +149,21 @@ def build_haproxy_config(cfg):
         mode = backend_def.get("mode", "http")
         balance = backend_def.get("balance", "roundrobin")
 
-        # Get linked servers - use unique names matching what we created
+        # Get linked servers - one shared row per distinct node:port, named
+        # `{server_name}-{port}`, identical to the name used in the build loop above.
         linked_servers = []
+        backend_port = str(backend_def.get("service", {}).get("port", "80"))
         for server in backend_def.get("servers", []):
             if server is None:
                 continue
-            linked_servers.append(f"{server.get('name', '')}_{backend_name}")
+            server_name = server.get("name", "")
+            _, port = _resolve_server_target(server_name, server.get("address", ""), backend_port, hostname_ip_map)
+            linked_servers.append(f"{server_name}-{port}")
 
         backend = {
             "name": backend_name,
             "mode": mode,
-            "balance": balance,
+            "algorithm": balance,
             "enabled": "1",
             "description": f"Backend pool for {backend_name}",
             "linkedServers": ",".join(linked_servers),  # Will be replaced with UUIDs
@@ -165,11 +175,13 @@ def build_haproxy_config(cfg):
             backend["healthCheck"] = f"{backend_name}_healthcheck"
 
         # Options
+        # "forwardfor" maps to the live `forwardFor` field. "http-server-close" has no
+        # dedicated field on the box (it's a HAProxy section option the box does not carry),
+        # so it is dropped rather than emitting a dead field; re-add via customOptions if
+        # it is ever needed.
         options = backend_def.get("options", [])
         if "forwardfor" in options:
-            backend["forwardfor"] = "1"
-        if "http-server-close" in options:
-            backend["httpClose"] = "1"
+            backend["forwardFor"] = "1"
 
         # Timeouts
         timeout_connect = backend_def.get("timeout_connect")
@@ -348,20 +360,20 @@ def _delete_frontend(client: OpnClient, uuid: str):
 
 # --- Cleanup functions for stale resources ---
 
-def _cleanup_deleted_servers(haproxy_config, client: OpnClient, _server_uuid_map: dict):
-    """Delete servers that exist in OPNsense but not in desired config.
+def _cleanup_deleted_servers(haproxy_config, client: OpnClient, server_uuid_map: dict):
+    """Delete server rows OPNsense holds that this config does not keep.
 
-    Servers are matched by (address, port) tuple since multiple backends
-    can reference the same server IP.
+    Matches by the UUIDs `_sync_servers` adopted (one per desired (address,
+    port)), not by (address, port) itself: the box can hold stale duplicate rows
+    at the same address:port (a per-backend leftover from an earlier config
+    shape), and those must be removed while the single adopted shared row for
+    that address:port is kept.
     """
     existing_servers = _search_servers(client)
-    # Build set of desired (address, port) keys from config
-    desired_keys = {(srv["address"], srv["port"]) for srv in haproxy_config["servers"]}
+    kept_uuids = {uuid for uuid in server_uuid_map.values() if uuid}
 
     for srv in existing_servers:
-        addr = srv.get("address", "")
-        port = srv.get("port", "")
-        if (addr, port) not in desired_keys:
+        if srv.get("uuid") not in kept_uuids:
             _delete_server(client, srv["uuid"])
 
 
@@ -408,6 +420,12 @@ def _cleanup_deleted_frontends(haproxy_config, client: OpnClient, _frontend_uuid
 def _sync_servers(haproxy_config, client: OpnClient):
     """
     Sync HAProxy servers. Returns (changed, server_uuid_map).
+
+    Servers are matched by (address, port). After the build step each desired
+    server has a unique (address, port) — a shared node:port is a single row — so
+    matching is unambiguous. `name` is part of the diff so a stale per-backend
+    name (e.g. `node_docker_https`) is renamed to the shared name (`node-80`)
+    exactly once and then stays stable.
     """
     changed = False
     existing_servers = _search_servers(client)
@@ -423,20 +441,19 @@ def _sync_servers(haproxy_config, client: OpnClient):
 
     for server in haproxy_config["servers"]:
         name = server["name"]
-        addr = server["address"]
-        port = server["port"]
-        key = (addr, port)
+        key = (server["address"], server["port"])
 
         if key in server_index:
-            # Update existing server matched by IP:port
+            # Update the existing server matched by IP:port
             current = server_index[key]
             uuid = current.get("uuid")
             server_uuid_map[name] = uuid
 
             if (
+                str(current.get("name")) != str(server.get("name")) or
                 str(current.get("checkport")) != str(server.get("checkport")) or
-                str(current.get("check")) != str(server.get("check", "1")) or
-                str(current.get("checkinterval")) != str(server.get("checkinterval")) or
+                str(current.get("mode")) != str(server.get("mode", "active")) or
+                str(current.get("checkInterval")) != str(server.get("checkInterval")) or
                 str(current.get("enabled")) != str(server.get("enabled", "1"))
             ):
                 _set_server(client, uuid, server)
@@ -447,19 +464,6 @@ def _sync_servers(haproxy_config, client: OpnClient):
             if result and result.get("uuid"):
                 server_uuid_map[name] = result["uuid"]
             changed = True
-
-    # Refresh server list to get all UUIDs
-    if changed:
-        existing_servers = _search_servers(client)
-        # Rebuild map by name for backend linking
-        for srv in existing_servers:
-            # Try to match by (address, port) to find our servers
-            addr = srv.get("address", "")
-            port = srv.get("port", "")
-            for server in haproxy_config["servers"]:
-                if server["address"] == addr and server["port"] == port:
-                    server_uuid_map[server["name"]] = srv.get("uuid")
-                    break
 
     return changed, server_uuid_map
 
@@ -482,14 +486,18 @@ def _sync_healthchecks(haproxy_config, client: OpnClient):
             uuid = current.get("uuid")
             healthcheck_uuid_map[name] = uuid
 
-            # Check if key fields changed
-            needs_update = False
-            if str(current.get("type")) != str(hc.get("type")):
-                needs_update = True
-            elif hc.get("type") == "http":
-                if (str(current.get("http_method")) != str(hc.get("http_method", "")) or
-                    str(current.get("http_uri")) != str(hc.get("http_uri", ""))):
-                    needs_update = True
+            # Check if key fields changed. `interval` and `checkport` drive the
+            # rendered `check inter <X> port <Y>` on each server line.
+            needs_update = (
+                str(current.get("type")) != str(hc.get("type"))
+                or str(current.get("interval")) != str(hc.get("interval", ""))
+                or str(current.get("checkport")) != str(hc.get("checkport", ""))
+            )
+            if hc.get("type") == "http" and not needs_update:
+                needs_update = (
+                    str(current.get("http_method")) != str(hc.get("http_method", ""))
+                    or str(current.get("http_uri")) != str(hc.get("http_uri", ""))
+                )
 
             if needs_update:
                 _set_healthcheck(client, uuid, hc)
@@ -540,14 +548,10 @@ def _sync_actions(haproxy_config, client: OpnClient):
             # Check if key fields changed
             needs_update = (
                 str(current.get("type")) != str(action.get("type"))
-                or str(current.get(_HTTP_REQUEST_SET_HEADER_NAME, ""))
-                != str(action.get(_HTTP_REQUEST_SET_HEADER_NAME, ""))
-                or str(current.get(_HTTP_REQUEST_SET_HEADER_CONTENT, ""))
-                != str(action.get(_HTTP_REQUEST_SET_HEADER_CONTENT, ""))
-                or str(current.get(_HTTP_REQUEST_ADD_HEADER_NAME, ""))
-                != str(action.get(_HTTP_REQUEST_ADD_HEADER_NAME, ""))
-                or str(current.get(_HTTP_REQUEST_ADD_HEADER_CONTENT, ""))
-                != str(action.get(_HTTP_REQUEST_ADD_HEADER_CONTENT, ""))
+                or str(current.get("http_request_action", ""))
+                != str(action.get("http_request_action", ""))
+                or str(current.get("http_request_option", ""))
+                != str(action.get("http_request_option", ""))
             )
 
             if needs_update:
@@ -577,11 +581,17 @@ def _sync_actions(haproxy_config, client: OpnClient):
     return changed, action_uuid_map_by_backend
 
 
-# Constants for action field names (used to avoid long line issues)
-_HTTP_REQUEST_SET_HEADER_NAME = "http_request_set_header_name"
-_HTTP_REQUEST_SET_HEADER_CONTENT = "http_request_set_header_content"
-_HTTP_REQUEST_ADD_HEADER_NAME = "http_request_add_header_name"
-_HTTP_REQUEST_ADD_HEADER_CONTENT = "http_request_add_header_content"
+# The old decomposed header field-name constants are gone: OPNsense stores the real
+# action content in http_request_action / http_request_option (compared in _sync_actions).
+
+
+def _same_uuid_set(a, b):
+    """Order-insensitive comparison of comma-separated UUID lists (linkedServers/
+    linkedActions): a link set that merely changed order is not a drift, and a
+    changed set is (a link added/removed must be applied)."""
+    sa = {x for x in (a or "").split(",") if x}
+    sb = {x for x in (b or "").split(",") if x}
+    return sa == sb
 
 
 def _sync_backends(haproxy_config, client: OpnClient, server_uuid_map,
@@ -624,16 +634,20 @@ def _sync_backends(haproxy_config, client: OpnClient, server_uuid_map,
 
             if (
                 str(current.get("mode")) != str(backend.get("mode")) or
-                str(current.get("balance")) != str(backend.get("balance")) or
-                str(current.get("linkedServers")) != backend.get("linkedServers", "") or
+                str(current.get("algorithm")) != str(backend.get("algorithm")) or
+                str(current.get("forwardFor")) != str(backend.get("forwardFor", "0")) or
+                not _same_uuid_set(current.get("linkedServers"),
+                                  backend.get("linkedServers")) or
+                not _same_uuid_set(current.get("linkedActions"),
+                                  backend.get("linkedActions")) or
+                str(current.get("healthCheck")) != str(backend.get("healthCheck", "")) or
                 str(current.get("tuning_timeoutConnect")) !=
                 backend.get("tuning_timeoutConnect", "") or
                 str(current.get("tuning_timeoutServer")) !=
                 backend.get("tuning_timeoutServer", "") or
-                str(current.get("tuning_timeoutTunnel")) !=
-                backend.get("tuning_timeoutTunnel", "") or
-                str(current.get("tuning_timeoutCheck")) !=
-                backend.get("tuning_timeoutCheck", "")
+                str(current.get("customOptions")) !=
+                str(backend.get("customOptions", "")) or
+                str(current.get("enabled")) != str(backend.get("enabled", "1"))
             ):
                 _set_backend(client, uuid, backend)
                 changed = True
